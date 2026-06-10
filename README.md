@@ -10,9 +10,13 @@ it does it **safely by default**. The riskier "fix a broken box" operations
 with `--dry-run` before anything changes.
 
 ```bash
-sudo ./linux-maintain.sh            # safe routine maintenance
+sudo ./linux-maintain.sh            # interactive menu — pick a maintenance mode
 sudo ./linux-maintain.sh --dry-run  # preview everything, change nothing
 ```
+
+> No flags **on a terminal** opens an interactive menu. Any flag — or a
+> non-interactive context (cron, systemd timer, piped input) — skips the menu
+> and runs exactly as flagged, so automation is never blocked.
 
 ---
 
@@ -37,7 +41,9 @@ your config and hopes for the best. This tool separates the two on purpose:
 ## Features
 
 **Safe (runs by default):**
+- Interactive menu when started with no flags from a terminal (auto-skipped for cron/timers)
 - `apt update` / `upgrade` / `full-upgrade` with sane non-interactive defaults
+- Connectivity check resistant to ICMP blocking (ping with an HTTP/204 `curl` fallback)
 - Correct kernel metapackage per distro (`linux-image-generic` on Ubuntu, arch-specific on Debian/Kali)
 - Bare-metal firmware, GPU drivers (NVIDIA / AMD / Intel), and CPU microcode — hardware-detected
 - VM/WSL guest tools (VMware, VirtualBox, KVM/QEMU, Hyper-V, WSL)
@@ -144,11 +150,24 @@ chmod +x linux-maintain.sh
 
 ## Usage & common use cases
 
-**1. Safe routine maintenance** (laptop/desktop/server, or a weekly cron job):
+**1. Interactive use** — run with no flags from a terminal and pick a mode:
 
 ```bash
 sudo ./linux-maintain.sh
 ```
+
+```text
+1) Safe Routine Maintenance (Default - Updates, Cleanup, TRIM)
+2) Full Aggressive Maintenance (Safe + Network/Mirror Fixes + Storage Tuning)
+3) Storage Tuning Only (+ Safe Maintenance)
+4) Network & Mirror Repair Only (+ Safe Maintenance)
+5) Dry-Run (Preview only, no changes)
+0) Exit
+```
+
+Each choice sets the same variables the flags set, then the run proceeds
+normally. In cron/systemd (no terminal) or with any flag, the menu is skipped —
+so option 1's behaviour is what an automated flag-less run gets.
 
 **2. Preview first — change nothing:**
 
@@ -188,6 +207,8 @@ sudo ./linux-maintain.sh --tune-storage
 
 ## Options
 
+> No flags + a real terminal = interactive menu. Any flag below skips it.
+
 | Flag | Type | What it does |
 |------|------|--------------|
 | `-n, --dry-run` | safe | Preview every action; change nothing |
@@ -209,8 +230,8 @@ sudo ./linux-maintain.sh --tune-storage
 
 ## What it does, step by step
 
-1. Parse flags, confirm root (unless `--dry-run`), open a timestamped log.
-2. Check connectivity (informational — never restarts the network).
+1. Parse flags — or, with no flags on a terminal, show the interactive menu. Confirm root (unless `--dry-run`), open a timestamped log.
+2. Check connectivity — ICMP ping with an HTTP/204 `curl` fallback for networks that drop ping (informational; never restarts the network).
 3. Detect the distro (`/etc/os-release`) and environment (bare metal / VM / WSL).
 4. *(opt-in)* `--repair-mirrors`: back up and repair apt sources before updating.
 5. `apt update` (with retries), then `upgrade` and `full-upgrade`.
@@ -230,7 +251,7 @@ sudo ./linux-maintain.sh --tune-storage
 
 - **Log:** `/var/log/linux-maintain_<timestamp>.log` (falls back to `/tmp`). Logs older than 7 days are pruned automatically.
 - **Report:** `<log>_report.txt` — OS, kernel, CPU, memory, disks, network, GPU.
-- **Backups:** any modified system file is copied to `FILE.bak_<timestamp>` before changes.
+- **Backups:** any modified system file is copied to `FILE.bak_<timestamp>` before changes, then locked to root-only access (`chmod 600`) to prevent information disclosure.
 
 **Reverting an aggressive change** — restore the backup, e.g.:
 
