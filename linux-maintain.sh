@@ -134,6 +134,7 @@ backup_file() {
   local src="$1"
   [[ -e $src ]] || return 0
   run_soft cp -a "$src" "${src}.bak_${START_STAMP}"
+  run_soft chmod 600 "${src}.bak_${START_STAMP}"   # lock backup to root (Information-Disclosure hardening)
   log_info "Backed up ${src} -> ${src}.bak_${START_STAMP}"
 }
 
@@ -292,7 +293,7 @@ repair_mirrors() {
       if grep -qiF "$bad" "$f" 2>/dev/null; then
         backup_file "$f"
         log_info "Replacing dead mirror '${bad}' in ${f}"
-        run_soft sed -i "s|https\?://${bad}|${official}|gI" "$f"
+        run_soft sed -i "s~https\?://${bad}~${official}~gI" "$f"
         changed=true
       fi
     done
@@ -383,8 +384,49 @@ set_swappiness() {
 }
 
 # =========================================================================== #
+#  Interactive menu
+#    Shown ONLY when the script is started with no flags AND from a real
+#    terminal. Selecting a number sets the very same variables the flags set,
+#    so automation (cron jobs / systemd timers, or any flagged run) is never
+#    blocked waiting for a keypress.
+# =========================================================================== #
+interactive_menu() {
+  _log_line "===============================================================" "$C_CYN"
+  _log_line "  Interactive Mode: Choose Maintenance Type" "${C_BOLD}${C_YLW}"
+  _log_line "===============================================================" "$C_CYN"
+  echo "  1) Safe Routine Maintenance (Default - Updates, Cleanup, TRIM)"
+  echo "  2) Full Aggressive Maintenance (Safe + Network/Mirror Fixes + Storage Tuning)"
+  echo "  3) Storage Tuning Only (+ Safe Maintenance)"
+  echo "  4) Network & Mirror Repair Only (+ Safe Maintenance)"
+  echo "  5) Dry-Run (Preview only, no changes)"
+  echo "  0) Exit"
+  echo ""
+  if ! read -rp "  [?] Enter your choice [0-5]: " choice; then
+    echo ""; log_info "No input received; exiting."; exit 0
+  fi
+  echo ""
+
+  case "$choice" in
+    1) log_info "Mode: Safe Routine Maintenance" ;;
+    2) log_info "Mode: Full Aggressive Maintenance"
+       DO_REPAIR_MIRRORS=true; AGGRESSIVE_NET=true; FORCE_IPV4=true
+       DO_TUNE_STORAGE=true;   DO_POWER_TOOLS=true ;;
+    3) log_info "Mode: Storage Tuning";          DO_TUNE_STORAGE=true ;;
+    4) log_info "Mode: Network & Mirror Repair"; DO_REPAIR_MIRRORS=true; AGGRESSIVE_NET=true; FORCE_IPV4=true ;;
+    5) log_info "Mode: Dry-Run";                 DRY_RUN=true ;;
+    0) log_info "Exiting..."; exit 0 ;;
+    *) log_err "Invalid choice. Exiting..."; exit 1 ;;
+  esac
+}
+
+# =========================================================================== #
 #  Argument parsing
 # =========================================================================== #
+# No flags AND attached to a real TTY (not a cron job / pipe) -> show the menu.
+if [[ $# -eq 0 && -t 0 ]]; then
+  interactive_menu
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--dry-run)          DRY_RUN=true ;;
@@ -424,6 +466,7 @@ fi
 # =========================================================================== #
 _log_line "===============================================================" "$C_CYN"
 _log_line "  linux-maintain ${SCRIPT_VERSION} — Debian / Ubuntu / Kali maintainer" "${C_BOLD}${C_GRN}"
+_log_line "  by Abdelrahman El-Maghraby" "$C_CYN"
 _log_line "  Started: $(date '+%Y-%m-%d %H:%M:%S')" "$C_CYN"
 [[ $DRY_RUN == true ]] && _log_line "  MODE: DRY RUN — no changes will be made" "${C_BOLD}${C_YLW}"
 _log_line "===============================================================" "$C_CYN"
@@ -432,10 +475,15 @@ _log_line "===============================================================" "$C_
 #  Connectivity check  (informational — never restarts your network)
 # =========================================================================== #
 log_step "Checking network connectivity"
-if ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 || ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+# ICMP-resistant check: try ping first; if pings are dropped (enterprise firewall
+# or pentest lab), fall back to a tiny HTTP/204 probe via curl before declaring
+# "no network". The curl branch is silent and degrades safely if curl is absent.
+if ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 \
+   || ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 \
+   || curl -fs -m 3 http://clients3.google.com/generate_204 >/dev/null 2>&1; then
   log_ok "Network is reachable."
 else
-  log_warn "No ICMP reply (network may still work, or may be down)."
+  log_warn "No ICMP reply and no HTTP probe response (network may still work, or may be down)."
   log_warn "Not touching network services automatically — apt will report errors if offline."
 fi
 
