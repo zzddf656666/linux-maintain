@@ -1,142 +1,71 @@
 # linux-maintain
 
-A single, safe, idempotent **system-maintenance tool for Debian, Ubuntu, and Kali**.
+![Bash](https://img.shields.io/badge/Bash-4%2B-4EAA25?logo=gnubash&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Debian%20%7C%20Ubuntu%20%7C%20Kali-A81D33?logo=debian&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue)
+![Version](https://img.shields.io/badge/Version-3.1.0-success)
 
-It does the boring-but-important work — update, upgrade, fix broken packages,
-install firmware/drivers/microcode, keep SSDs trimmed, and produce a report — and
-it does it **safely by default**. The riskier "fix a broken box" operations
-(rewriting apt mirrors, forcing out-of-tree drivers, deep storage tuning) are
-**strictly opt-in**, always **back up the files they touch**, and can be previewed
-with `--dry-run` before anything changes.
+**One script. Safe by default. Everything logged.**
 
-```bash
-sudo ./linux-maintain.sh            # interactive menu — pick a maintenance mode
-sudo ./linux-maintain.sh --dry-run  # preview everything, change nothing
-```
+`linux-maintain.sh` is a single, idempotent maintenance script for Debian, Ubuntu and Kali. A default run updates the system, repairs broken package state, installs the right firmware/drivers/microcode on bare metal, enables SSD TRIM, cleans up, and writes a full log plus a system report — **without ever rewriting your apt sources, editing `/etc/fstab`, or restarting your network**.
 
-> No flags **on a terminal** opens an interactive menu. Any flag — or a
-> non-interactive context (cron, systemd timer, piped input) — skips the menu
-> and runs exactly as flagged, so automation is never blocked.
+The risky stuff (mirror rewriting, forced out-of-tree drivers, persistent IPv4, deep storage tuning) exists too — but it is **strictly opt-in**, always creates a timestamped backup before touching a system file, and runs through the same safe runners and `--dry-run` preview as everything else.
 
 ---
 
 ## Why it's built this way
 
-Most "all-in-one" maintenance scripts fail in one of two directions: they're either
-too timid to fix a genuinely broken system, or they're a kitchen sink that rewrites
-your config and hopes for the best. This tool separates the two on purpose:
+Maintenance scripts found online tend to fail in one of two directions: they either do too little to matter, or they "fix" things you never asked them to touch — your mirrors, your fstab, your network — and leave no trace of what changed.
 
-- **A default run is conservative.** It never rewrites `/etc/apt/sources.list`,
-  never edits `/etc/fstab`, and never restarts networking — so it's safe to run on
-  a remote server or in a cron job.
-- **The aggressive fixes are real, but gated.** Each one lives behind its own flag,
-  creates a timestamped backup of any file it modifies, and runs through the same
-  `run` / `run_soft` wrappers and `--dry-run` preview as everything else.
-- **Failures are explicit.** The script uses `set -Eeuo pipefail` with an error trap
-  that reports the exact failing line. Optional steps that are *allowed* to fail are
-  the only ones that continue — there is no blanket `|| true`.
+This script is built on three rules:
+
+1. **Safe by default.** A plain `sudo ./linux-maintain.sh` performs only routine, reversible maintenance.
+2. **Dangerous actions are opt-in, backed up, and previewable.** Every aggressive fix requires an explicit flag, backs up the file it modifies, and can be rehearsed first with `--dry-run`.
+3. **Everything is observable.** Every command is echoed before it runs, and the entire session — including raw `apt`/`dpkg` output and errors — is captured to a timestamped log file.
 
 ---
 
 ## Features
 
-**Safe (runs by default):**
-- Interactive menu when started with no flags from a terminal (auto-skipped for cron/timers)
-- `apt update` / `upgrade` / `full-upgrade` with sane non-interactive defaults
-- Connectivity check resistant to ICMP blocking (ping with an HTTP/204 `curl` fallback)
-- Correct kernel metapackage per distro (`linux-image-generic` on Ubuntu, arch-specific on Debian/Kali)
-- Bare-metal firmware, GPU drivers (NVIDIA / AMD / Intel), and CPU microcode — hardware-detected
-- VM/WSL guest tools (VMware, VirtualBox, KVM/QEMU, Hyper-V, WSL)
-- SSD periodic TRIM (`fstrim.timer`)
-- `autoremove` / `autoclean` / `--fix-broken` / `dpkg --configure -a`
-- Timestamped log + read-only system report, plus a `fastfetch` summary
+### Core (safe, default run)
+- Full `apt` refresh, `upgrade` and `full-upgrade` with retries and sane dpkg conffile handling.
+- **Disk-space guard** — aborts before package operations if `/` has less than 1024 MB free, preventing half-finished upgrades from bricking a system. *(new in 3.1.0)*
+- **Snap & Flatpak updates** — refreshed automatically when the tools are installed; silently skipped when they are not. *(new in 3.1.0)*
+- Correct kernel metapackage per distro and architecture (Ubuntu / Debian / Kali, amd64 / arm64 / i386).
+- Bare-metal hardware care: firmware, GPU drivers (NVIDIA / AMD / Intel detected via `lspci`), CPU microcode — skipped automatically inside VMs.
+- Guest tools when virtualised: VMware, VirtualBox, KVM/QEMU, Hyper-V, WSL.
+- SSD periodic TRIM (`fstrim.timer`) enabled when the root device is solid-state.
+- Cleanup & repair: `autoremove`, `autoclean`, `--fix-broken`, `dpkg --configure -a`.
+- **Deep cleanup** — purges residual configuration of removed packages (`rc` state in dpkg). *(new in 3.1.0)*
+- **Full session logging** — *all* stdout and stderr (including apt/dpkg output) is mirrored to `/var/log/linux-maintain_<timestamp>.log`. *(new in 3.1.0)*
+- **Never blocks unattended runs** — `DEBIAN_FRONTEND=noninteractive` plus `NEEDRESTART_MODE=a`, so Ubuntu's *needrestart* prompts can't stall a cron/timer run. *(new in 3.1.0)*
+- System report (CPU, memory, disks, network, GPU) written next to the log.
+- Self log-rotation: its own logs older than 7 days are removed.
 
-**Aggressive (opt-in, backed up, dry-run-able):**
-- `--repair-mirrors` — smart apt mirror repair
-- `--install-realtek` — force the RTL8188EUS DKMS Wi-Fi driver
-- `--aggressive-network` — persistent IPv4 + raised apt retries
-- `--tune-storage` — persistent I/O scheduler, `noatime` (SSD), `vm.swappiness` (HDD)
+### Interactive TUI *(new in 3.1.0)*
+Run the script with no flags from a real terminal and you get a menu. If **whiptail** is installed you get a proper TUI dialog; if it isn't — or you press <kbd>Esc</kbd>/Cancel — the script **gracefully degrades** to the classic numbered text menu. Automation is never affected: any flagged or non-TTY run skips the menu entirely.
 
----
+### Opt-in aggressive repairs
+| Flag | What it does |
+|---|---|
+| `--repair-mirrors` | Replaces known-dead apt mirrors and restores the official repos for your detected distro (sources are backed up first). |
+| `--install-realtek` | Force-installs the out-of-tree RTL8188EUS DKMS Wi-Fi driver (TP-Link TL-WN725N and similar). |
+| `--aggressive-network` | Forces IPv4 + raises apt retries; persists an IPv4 apt config after the first failure. |
+| `--tune-storage` | Persistent I/O scheduler (udev rule), `noatime` on root for SSDs, `vm.swappiness=10` for HDDs. |
 
-## Supported systems
-
-Anything `apt`-based. Requires `root` for real runs (`--dry-run` works without it).
-
-**Distributions**
-
-| Distro | Supported | Notes |
-|--------|:---------:|-------|
-| Ubuntu (and derivatives) | ✅ | incl. 24.04 deb822 `ubuntu.sources` handling |
-| Debian | ✅ | |
-| Kali Linux | ✅ | rolling release |
-| Fedora / RHEL (`dnf`) | ❌ | not apt-based |
-| Arch (`pacman`) | ❌ | not apt-based |
-
-**Environments**
-
-| Environment | Behaviour |
-|-------------|-----------|
-| Bare metal | Installs firmware, GPU drivers, microcode |
-| VM (VMware, VirtualBox, KVM/QEMU, Hyper-V) | Installs the matching guest tools instead |
-| WSL | Installs WSL utilities (`wslu`) |
-
-**Architectures**
-
-| Arch | Kernel metapackage |
-|------|--------------------|
-| `amd64` | `linux-image-generic` (Ubuntu) / `linux-image-amd64` (Debian, Kali) |
-| `arm64` | `linux-image-generic` (Ubuntu) / `linux-image-arm64` (Debian, Kali) |
-| `i386` | `linux-image-686` (Debian, Kali) |
+Every file these touch is first copied to `<file>.bak_<timestamp>` with root-only permissions.
 
 ---
 
-## Wi-Fi adapters (Realtek / TP-Link)
+## Requirements
 
-The `--install-realtek` flag (and the auto-detection on bare metal) installs
-**`realtek-rtl8188eus-dkms`**, which drives the **Realtek RTL8188EUS** chipset used
-by small TP-Link USB adapters such as the **TL-WN725N** and **TL-WN722N (v2/v3)**.
-
-> **If you have an AC adapter** (e.g. **Archer T2U / T3U**), it uses a different
-> chipset (RTL8811AU / RTL8812AU) and needs **`rtl8812au-dkms`** instead — not
-> `rtl8188eus`. Check your chipset with `lsusb` before installing.
-
----
-
-## ⚠️ Disclaimer
-
-**This tool installs, upgrades, and removes packages, and — when you pass the
-aggressive flags — modifies system files.**
-
-In particular, `--repair-mirrors` **overwrites `/etc/apt/sources.list`** (and backs
-up `ubuntu.sources` on Ubuntu 24.04+), `--tune-storage` **edits `/etc/fstab`** and
-writes `udev`/`sysctl` rules, and `--aggressive-network` **writes a persistent apt
-config**. Every modified file is copied to `FILE.bak_<timestamp>` first, but you are
-still responsible for what runs on your machine.
-
-- Always run with `--dry-run` first and read the planned actions.
-- Review the script before running it as root (it's short and commented).
-- Use it at your own risk. **No warranty** — see [LICENSE](LICENSE).
+- Debian, Ubuntu or Kali (any apt-based derivative should work).
+- Bash 4+ and root privileges (`--dry-run` works without root).
+- Optional: `whiptail` for the TUI menu — the script works fine without it.
 
 ---
 
 ## Installation
-
-**One-liner (download + make executable):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zzddf656666/linux-maintain/main/linux-maintain.sh -o linux-maintain.sh \
-  && chmod +x linux-maintain.sh
-```
-
-(or with `wget`)
-
-```bash
-wget -qO linux-maintain.sh https://raw.githubusercontent.com/zzddf656666/linux-maintain/main/linux-maintain.sh \
-  && chmod +x linux-maintain.sh
-```
-
-**Or clone the repo:**
 
 ```bash
 git clone https://github.com/zzddf656666/linux-maintain.git
@@ -144,168 +73,136 @@ cd linux-maintain
 chmod +x linux-maintain.sh
 ```
 
-> Good habit: open the file and skim it before running anything as root.
-
 ---
 
-## Usage & common use cases
-
-**1. Interactive use** — run with no flags from a terminal and pick a mode:
+## Usage
 
 ```bash
+# Interactive menu (TUI if whiptail is present, classic text menu otherwise)
 sudo ./linux-maintain.sh
-```
 
-```text
-1) Safe Routine Maintenance (Default - Updates, Cleanup, TRIM)
-2) Full Aggressive Maintenance (Safe + Network/Mirror Fixes + Storage Tuning)
-3) Storage Tuning Only (+ Safe Maintenance)
-4) Network & Mirror Repair Only (+ Safe Maintenance)
-5) Dry-Run (Preview only, no changes)
-0) Exit
-```
-
-Each choice sets the same variables the flags set, then the run proceeds
-normally. In cron/systemd (no terminal) or with any flag, the menu is skipped —
-so option 1's behaviour is what an automated flag-less run gets.
-
-**2. Preview first — change nothing:**
-
-```bash
-sudo ./linux-maintain.sh --dry-run
-```
-
-**3. Unattended (no prompts), e.g. from a timer:**
-
-```bash
+# Safe routine maintenance, non-interactive (cron/timers)
 sudo ./linux-maintain.sh --yes --no-reboot
-```
 
-**4. "My system is broken" — aggressive repair** (dead mirrors + flaky network):
+# Preview EVERYTHING first — no changes are made
+sudo ./linux-maintain.sh --dry-run
 
-```bash
-# preview the repair plan
-sudo ./linux-maintain.sh --dry-run --repair-mirrors --aggressive-network
-
-# then run it for real
+# Rehearse an aggressive repair, then run it for real
+sudo ./linux-maintain.sh --dry-run --repair-mirrors
 sudo ./linux-maintain.sh --repair-mirrors --aggressive-network
-```
 
-**5. Install a TP-Link / Realtek RTL8188EUS USB Wi-Fi driver:**
-
-```bash
+# Force the Realtek USB Wi-Fi driver
 sudo ./linux-maintain.sh --install-realtek
 ```
 
-**6. Performance tuning for a fresh install:**
+### All options
 
-```bash
-sudo ./linux-maintain.sh --tune-storage
+```text
+SAFE OPTIONS (default run is safe):
+  -n, --dry-run          Preview every action; change nothing
+  -y, --yes              Non-interactive (assume "yes"); good for cron/timers
+      --no-drivers       Skip firmware / GPU drivers / microcode (bare metal)
+      --power-tools      Install laptop power-management tools (TLP, thermald)
+      --force-ipv4       Force apt over IPv4 for this run only
+      --reboot           Reboot at the end if a reboot is required
+      --no-reboot        Never reboot, even if one is required
+      --no-color         Disable coloured output
+  -V, --version          Print version and exit
+  -h, --help             Show this help and exit
+
+AGGRESSIVE / REPAIR OPTIONS (opt-in; modify system files; always backed up):
+      --repair-mirrors     Replace dead apt mirrors, restore official repos
+      --install-realtek    Force the RTL8188EUS DKMS Wi-Fi driver
+      --aggressive-network Force IPv4 + more retries; persist IPv4 on failure
+      --tune-storage       Persistent I/O scheduler, noatime (SSD), swappiness (HDD)
 ```
 
 ---
 
-## Options
+## What a default run does, step by step
 
-> No flags + a real terminal = interactive menu. Any flag below skips it.
-
-| Flag | Type | What it does |
-|------|------|--------------|
-| `-n, --dry-run` | safe | Preview every action; change nothing |
-| `-y, --yes` | safe | Non-interactive (assume "yes"); good for cron/timers |
-| `--no-drivers` | safe | Skip the bare-metal firmware/GPU/microcode block |
-| `--power-tools` | safe | Install laptop power management (TLP, thermald, powertop) |
-| `--force-ipv4` | safe | Force apt over IPv4 for this run only |
-| `--reboot` | safe | Reboot at the end **if** a reboot is required |
-| `--no-reboot` | safe | Never reboot, even if one is required |
-| `--no-color` | safe | Disable coloured output |
-| `-V, --version` | safe | Print version and exit |
-| `-h, --help` | safe | Show help and exit |
-| `--repair-mirrors` | **aggressive** | Replace dead apt mirrors and restore official repos (backs up sources) |
-| `--install-realtek` | **aggressive** | Force-install the RTL8188EUS DKMS driver |
-| `--aggressive-network` | **aggressive** | Force IPv4 + raise apt retries; persist IPv4 config on failure |
-| `--tune-storage` | **aggressive** | Persistent I/O scheduler (udev), `noatime` on root (SSD), `vm.swappiness=10` (HDD) |
+1. Checks free space on `/` — aborts below 1024 MB.
+2. Checks connectivity (ICMP, then a silent HTTP/204 probe — never restarts your network).
+3. Detects distro, architecture, and environment (bare metal / VM / WSL).
+4. Refreshes package lists with retries; upgrades and full-upgrades packages.
+5. Updates Snap and Flatpak packages if those tools exist.
+6. Ensures the correct kernel metapackage is installed.
+7. Installs firmware / GPU drivers / microcode (bare metal) or guest tools (VMs).
+8. Enables SSD TRIM and runs `fstrim`.
+9. Cleans up: autoremove, autoclean, fix-broken, `dpkg --configure -a`, purges `rc` residual configs, refreshes GRUB.
+10. Writes a system report, rotates old logs, prints a summary, and tells you if a reboot is needed.
 
 ---
 
-## What it does, step by step
+## Logging
 
-1. Parse flags — or, with no flags on a terminal, show the interactive menu. Confirm root (unless `--dry-run`), open a timestamped log.
-2. Check connectivity — ICMP ping with an HTTP/204 `curl` fallback for networks that drop ping (informational; never restarts the network).
-3. Detect the distro (`/etc/os-release`) and environment (bare metal / VM / WSL).
-4. *(opt-in)* `--repair-mirrors`: back up and repair apt sources before updating.
-5. `apt update` (with retries), then `upgrade` and `full-upgrade`.
-6. Ensure the correct kernel metapackage for the distro/arch.
-7. On bare metal: firmware, detected GPU drivers, CPU microcode; auto-Realtek if the adapter is present.
-8. *(opt-in)* `--install-realtek`: force the RTL8188EUS DKMS driver in any environment.
-9. Install VM/WSL guest tools when running virtualised.
-10. *(opt-in)* `--power-tools` on laptops.
-11. Storage: SSD TRIM by default; *(opt-in)* `--tune-storage` for scheduler/fstab/swappiness.
-12. Cleanup & repair: `autoremove`, `autoclean`, `--fix-broken`, `dpkg --configure -a`, `update-grub`.
-13. Install `fastfetch`, write a read-only report, rotate old logs, show a summary.
-14. Reboot only if required, honouring `--reboot` / `--no-reboot` / `--yes`.
+Every non-dry run writes two files (to `/var/log`, or `/tmp` if not writable):
 
----
-
-## Logs & backups
-
-- **Log:** `/var/log/linux-maintain_<timestamp>.log` (falls back to `/tmp`). Logs older than 7 days are pruned automatically.
-- **Report:** `<log>_report.txt` — OS, kernel, CPU, memory, disks, network, GPU.
-- **Backups:** any modified system file is copied to `FILE.bak_<timestamp>` before changes, then locked to root-only access (`chmod 600`) to prevent information disclosure.
-
-**Reverting an aggressive change** — restore the backup, e.g.:
-
-```bash
-sudo cp /etc/apt/sources.list.bak_<timestamp> /etc/apt/sources.list
-sudo cp /etc/fstab.bak_<timestamp> /etc/fstab
-sudo rm -f /etc/apt/apt.conf.d/99force-ipv4 /etc/udev/rules.d/60-ioscheduler.rules /etc/sysctl.d/99-swappiness.conf
+```text
+/var/log/linux-maintain_<timestamp>.log          # the FULL session: script + apt + errors
+/var/log/linux-maintain_<timestamp>_report.txt   # hardware/system report
 ```
+
+Since v3.1.0 the log captures **all** stdout/stderr via `exec > >(tee -a "$LOGFILE") 2>&1` — so apt's own output and any unexpected error lands in the file, not just the script's messages. When run from a colour terminal the log will contain ANSI colour codes; view it with `less -R` or strip them with `sed 's/\x1b\[[0-9;]*m//g'`.
 
 ---
 
 ## Automating safe maintenance (systemd timer)
 
-`/etc/systemd/system/linux-maintain.service`
-
-```ini
+```bash
+sudo tee /etc/systemd/system/linux-maintain.service > /dev/null <<'EOF'
 [Unit]
-Description=Safe system maintenance
+Description=Safe system maintenance (linux-maintain)
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/linux-maintain.sh --yes --no-reboot
-```
+ExecStart=/opt/linux-maintain/linux-maintain.sh --yes --no-reboot
+EOF
 
-`/etc/systemd/system/linux-maintain.timer`
-
-```ini
+sudo tee /etc/systemd/system/linux-maintain.timer > /dev/null <<'EOF'
 [Unit]
-Description=Run system maintenance weekly
+Description=Weekly safe maintenance
 
 [Timer]
-OnCalendar=Sun *-*-* 03:00:00
+OnCalendar=Sun 04:00
+RandomizedDelaySec=30min
 Persistent=true
 
 [Install]
 WantedBy=timers.target
-```
+EOF
 
-```bash
-sudo cp linux-maintain.sh /usr/local/sbin/ && sudo chmod +x /usr/local/sbin/linux-maintain.sh
+sudo install -D -m 0755 linux-maintain.sh /opt/linux-maintain/linux-maintain.sh
+sudo systemctl daemon-reload
 sudo systemctl enable --now linux-maintain.timer
 ```
 
-> Keep the aggressive flags out of automated runs — use them only when you're fixing a problem by hand.
+The menu never blocks automation: it appears only when the script is started with **no flags from a real terminal**, and `NEEDRESTART_MODE=a` keeps Ubuntu's service-restart prompts from stalling unattended runs.
 
 ---
 
+## Safety model
+
+- `run` executes critical steps and aborts on failure; `run_soft` executes optional steps and continues with a warning.
+- Both honour `--dry-run`: the command is printed, nothing is executed.
+- The ERR trap reports the exact line and command of any unexpected failure.
+- Aggressive actions back up every file they touch to `<file>.bak_<timestamp>` (mode 600).
+- The disk-space guard refuses to start package operations on a nearly-full root partition (a `--dry-run` only warns, so previews always complete).
+
+## ⚠️ Disclaimer
+
+This script modifies system packages and (only when explicitly asked) system configuration files. Read it before running it, rehearse aggressive options with `--dry-run`, and keep backups of anything you cannot afford to lose. It is provided as-is under the MIT licence.
+
+## Testing
+
+`test_behavior.sh` runs the script end-to-end inside a container with stubbed package managers and asserts: full-session logging, no duplicated log lines, `NEEDRESTART_MODE` propagation, the disk-space abort and dry-run-warn paths, the `rc` purge, Snap/Flatpak handling, and all three TUI degradation paths (whiptail select, Cancel → classic menu, no whiptail → classic menu). Requires root; intended for disposable environments.
+
 ## Contributing
 
-Issues and pull requests welcome. Please keep the safe-by-default philosophy:
-new system-modifying behaviour should be opt-in, backed up, and dry-run-able.
+Issues and pull requests are welcome — especially reports from distros or hardware I haven't tested. Please run `shellcheck` and `bash test_behavior.sh` (in a disposable VM/container) before submitting.
 
 ## License
 
-MIT © Abdelrahman Fekry El-Maghraby — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). © 2026 Abdelrahman Fekry El-Maghraby.

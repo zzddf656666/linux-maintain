@@ -1,0 +1,12 @@
+# Logs & reports produced by the script (live in /var/log, but just in case)
+*.log
+*_report.txt
+
+# Timestamped backups created by aggressive fixes
+*.bak_*
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

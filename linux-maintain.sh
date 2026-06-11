@@ -23,7 +23,7 @@ set -Eeuo pipefail
 # =========================================================================== #
 #  Constants & defaults
 # =========================================================================== #
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_STAMP="$(date +'%Y-%m-%d_%H-%M-%S')"
 
@@ -45,6 +45,9 @@ AGGRESSIVE_NET=false        # --aggressive-network : persistent IPv4 + more retr
 readonly APT_RETRIES_DEFAULT=3
 readonly APT_RETRIES_AGGRESSIVE=8
 
+# Abort threshold for free space on / before package operations (MB).
+readonly MIN_FREE_MB=1024
+
 # Known-dead / hijacked mirror hosts to replace when --repair-mirrors is used.
 # These are examples — edit the list to match mirrors that have failed for you.
 BAD_MIRROR_HOSTS=(
@@ -53,7 +56,9 @@ BAD_MIRROR_HOSTS=(
 )
 
 LOGFILE=""                  # set after we confirm we are root
+EXEC_LOG_ACTIVE=false       # true once exec>tee captures all output (full logging)
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a   # auto-restart services; never block on needrestart prompts
 
 # apt options applied to every install/upgrade (assume-yes config handling).
 readonly APT_OPTS=(
@@ -81,6 +86,9 @@ _log_line() {
   else
     printf '%s\n' "$raw"
   fi
+  # When exec>tee full logging is active, stdout already lands in the log file;
+  # the explicit append below would duplicate every line, so it is skipped.
+  [[ $EXEC_LOG_ACTIVE == true ]] && return 0
   [[ -n $LOGFILE ]] && printf '%s\n' "$raw" >> "$LOGFILE" 2>/dev/null || true
 }
 log_info() { _log_line "[*]  $*" "$C_BLU"; }
@@ -204,6 +212,29 @@ enable_persistent_ipv4() {
   fi
   write_file "$conf" 'Acquire::ForceIPv4 "true";'
   log_ok "Configured apt to prefer IPv4 (${conf})."
+}
+
+# =========================================================================== #
+#  Disk space guard: abort before package operations if / is nearly full
+#    A real run aborts below MIN_FREE_MB (default 1024 MB) to prevent a
+#    half-finished upgrade from crashing the system. A --dry-run only warns,
+#    so the preview always completes.
+# =========================================================================== #
+check_disk_space() {
+  local avail_mb
+  avail_mb="$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ -z $avail_mb || ! $avail_mb =~ ^[0-9]+$ ]]; then
+    log_warn "Could not determine free space on /; continuing without the guard."
+    return 0
+  fi
+  if (( avail_mb < MIN_FREE_MB )); then
+    if [[ $DRY_RUN == true ]]; then
+      log_warn "Free space on / is ${avail_mb} MB (< ${MIN_FREE_MB} MB) — a real run would ABORT here."
+      return 0
+    fi
+    die "Free space on / is ${avail_mb} MB — below the ${MIN_FREE_MB} MB safety minimum. Free up space and retry. Aborting to prevent a broken upgrade."
+  fi
+  log_ok "Free space on /: ${avail_mb} MB (minimum required: ${MIN_FREE_MB} MB)."
 }
 
 # =========================================================================== #
@@ -391,20 +422,40 @@ set_swappiness() {
 #    blocked waiting for a keypress.
 # =========================================================================== #
 interactive_menu() {
-  _log_line "===============================================================" "$C_CYN"
-  _log_line "  Interactive Mode: Choose Maintenance Type" "${C_BOLD}${C_YLW}"
-  _log_line "===============================================================" "$C_CYN"
-  echo "  1) Safe Routine Maintenance (Default - Updates, Cleanup, TRIM)"
-  echo "  2) Full Aggressive Maintenance (Safe + Network/Mirror Fixes + Storage Tuning)"
-  echo "  3) Storage Tuning Only (+ Safe Maintenance)"
-  echo "  4) Network & Mirror Repair Only (+ Safe Maintenance)"
-  echo "  5) Dry-Run (Preview only, no changes)"
-  echo "  0) Exit"
-  echo ""
-  if ! read -rp "  [?] Enter your choice [0-5]: " choice; then
-    echo ""; log_info "No input received; exiting."; exit 0
+  local choice=""
+
+  # --- Preferred: whiptail TUI (used only when the tool is installed) -------- #
+  if have whiptail; then
+    # fd swap (3>&1 1>&2 2>&3) captures the selection; Cancel/Esc or any
+    # whiptail failure leaves choice empty and we degrade to the classic menu.
+    choice="$(whiptail --title "linux-maintain ${SCRIPT_VERSION}" \
+      --menu "Choose maintenance type:" 18 74 6 \
+        "1" "Safe Routine Maintenance (default)" \
+        "2" "Full Aggressive Maintenance (network/mirror fixes + tuning)" \
+        "3" "Storage Tuning Only (+ safe maintenance)" \
+        "4" "Network & Mirror Repair Only (+ safe maintenance)" \
+        "5" "Dry-Run (preview only, no changes)" \
+        "0" "Exit" \
+      3>&1 1>&2 2>&3)" || choice=""
   fi
-  echo ""
+
+  # --- Fallback: classic text menu (no whiptail, or user cancelled) ---------- #
+  if [[ -z $choice ]]; then
+    _log_line "===============================================================" "$C_CYN"
+    _log_line "  Interactive Mode: Choose Maintenance Type" "${C_BOLD}${C_YLW}"
+    _log_line "===============================================================" "$C_CYN"
+    echo "  1) Safe Routine Maintenance (Default - Updates, Cleanup, TRIM)"
+    echo "  2) Full Aggressive Maintenance (Safe + Network/Mirror Fixes + Storage Tuning)"
+    echo "  3) Storage Tuning Only (+ Safe Maintenance)"
+    echo "  4) Network & Mirror Repair Only (+ Safe Maintenance)"
+    echo "  5) Dry-Run (Preview only, no changes)"
+    echo "  0) Exit"
+    echo ""
+    if ! read -rp "  [?] Enter your choice [0-5]: " choice; then
+      echo ""; log_info "No input received; exiting."; exit 0
+    fi
+    echo ""
+  fi
 
   case "$choice" in
     1) log_info "Mode: Safe Routine Maintenance" ;;
@@ -459,6 +510,12 @@ if [[ $DRY_RUN == false ]]; then
   LOGDIR="/var/log"; [[ -w $LOGDIR ]] || LOGDIR="/tmp"
   LOGFILE="${LOGDIR}/linux-maintain_${START_STAMP}.log"
   : > "$LOGFILE" 2>/dev/null || LOGFILE=""
+  # Full logging: mirror ALL stdout + stderr (apt, dpkg, errors — everything)
+  # into the log file, not just the script's own messages.
+  if [[ -n $LOGFILE ]]; then
+    exec > >(tee -a "$LOGFILE") 2>&1
+    EXEC_LOG_ACTIVE=true
+  fi
 fi
 
 # =========================================================================== #
@@ -512,6 +569,9 @@ log_info "Environment: ${VIRT} (bare metal: ${IS_BAREMETAL})"
 # =========================================================================== #
 #  Update & upgrade
 # =========================================================================== #
+log_step "Checking free disk space on /"
+check_disk_space
+
 log_step "Updating package lists"
 apt_update
 
@@ -519,6 +579,21 @@ log_step "Upgrading installed packages"
 run_soft apt-get upgrade -y "${APT_OPTS[@]}"
 run_soft apt-get full-upgrade -y "${APT_OPTS[@]}"
 log_ok "Upgrade step complete."
+
+# --- Snap & Flatpak (updated only if the tool is actually installed) -------- #
+log_step "Updating Snap and Flatpak packages (if present)"
+if have snap; then
+  run_soft snap refresh
+  log_ok "Snap packages refreshed."
+else
+  log_info "snap not installed; skipping."
+fi
+if have flatpak; then
+  run_soft flatpak update -y
+  log_ok "Flatpak packages updated."
+else
+  log_info "flatpak not installed; skipping."
+fi
 
 # =========================================================================== #
 #  Kernel metapackage (correct name per distro)
@@ -660,6 +735,16 @@ run_soft apt-get autoremove -y "${APT_OPTS[@]}"
 run_soft apt-get autoclean -y "${APT_OPTS[@]}"
 run_soft apt-get --fix-broken install -y "${APT_OPTS[@]}"
 run_soft dpkg --configure -a
+
+# --- Deep cleanup: purge residual configs of removed packages (rc state) ---- #
+rc_count="$(dpkg -l 2>/dev/null | awk '/^rc/' | wc -l)"
+if (( rc_count > 0 )); then
+  log_info "Found ${rc_count} residual-config (rc) package(s) to purge."
+  run_soft bash -c "dpkg -l | awk '/^rc/ { print \$2 }' | xargs -r apt-get purge -y"
+else
+  log_info "No residual-config (rc) packages to purge."
+fi
+
 have update-grub && run_soft update-grub
 
 # =========================================================================== #
