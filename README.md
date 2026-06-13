@@ -1,4 +1,4 @@
-# linux-maintain
+# 🐧 linux-maintain
 
 ![Bash](https://img.shields.io/badge/Bash-4%2B-4EAA25?logo=gnubash&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Debian%20%7C%20Ubuntu%20%7C%20Kali-A81D33?logo=debian&logoColor=white)
@@ -13,7 +13,25 @@ The risky stuff (mirror rewriting, forced out-of-tree drivers, persistent IPv4, 
 
 ---
 
-## Why it's built this way
+## 📖 Table of Contents
+
+- [🧱 Why it's built this way](#-why-its-built-this-way)
+- [✨ Features](#-features)
+- [📦 Requirements](#-requirements)
+- [🚀 Installation](#-installation)
+- [💻 Usage](#-usage)
+- [📋 What a default run does, step by step](#-what-a-default-run-does-step-by-step)
+- [📝 Logging](#-logging)
+- [⏰ Automating safe maintenance (systemd timer)](#-automating-safe-maintenance-systemd-timer)
+- [🔒 Safety model](#-safety-model)
+- [🚨 Disclaimer](#-disclaimer)
+- [🧪 Testing](#-testing)
+- [🤝 Contributing](#-contributing)
+- [📜 License](#-license)
+
+---
+
+## 🧱 Why it's built this way
 
 Maintenance scripts found online tend to fail in one of two directions: they either do too little to matter, or they "fix" things you never asked them to touch — your mirrors, your fstab, your network — and leave no trace of what changed.
 
@@ -25,7 +43,7 @@ This script is built on three rules:
 
 ---
 
-## Features
+## ✨ Features
 
 ### Core (safe, default run)
 - Full `apt` refresh, `upgrade` and `full-upgrade` with retries and sane dpkg conffile handling.
@@ -57,7 +75,7 @@ Every file these touch is first copied to `<file>.bak_<timestamp>` with root-onl
 
 ---
 
-## Requirements
+## 📦 Requirements
 
 - Debian, Ubuntu or Kali (any apt-based derivative should work).
 - Bash 4+ and root privileges (`--dry-run` works without root).
@@ -65,7 +83,7 @@ Every file these touch is first copied to `<file>.bak_<timestamp>` with root-onl
 
 ---
 
-## Installation
+## 🚀 Installation
 
 ```bash
 git clone https://github.com/zzddf656666/linux-maintain.git
@@ -75,7 +93,7 @@ chmod +x linux-maintain.sh
 
 ---
 
-## Usage
+## 💻 Usage
 
 ```bash
 # Interactive menu (TUI if whiptail is present, classic text menu otherwise)
@@ -119,7 +137,7 @@ AGGRESSIVE / REPAIR OPTIONS (opt-in; modify system files; always backed up):
 
 ---
 
-## What a default run does, step by step
+## 📋 What a default run does, step by step
 
 1. Checks free space on `/` — aborts below 1024 MB.
 2. Checks connectivity (ICMP, then a silent HTTP/204 probe — never restarts your network).
@@ -134,7 +152,7 @@ AGGRESSIVE / REPAIR OPTIONS (opt-in; modify system files; always backed up):
 
 ---
 
-## Logging
+## 📝 Logging
 
 Every non-dry run writes two files (to `/var/log`, or `/tmp` if not writable):
 
@@ -147,7 +165,7 @@ Since v3.1.0 the log captures **all** stdout/stderr via `exec > >(tee -a "$LOGFI
 
 ---
 
-## Automating safe maintenance (systemd timer)
+## ⏰ Automating safe maintenance (systemd timer)
 
 ```bash
 sudo tee /etc/systemd/system/linux-maintain.service > /dev/null <<'EOF'
@@ -183,7 +201,7 @@ The menu never blocks automation: it appears only when the script is started wit
 
 ---
 
-## Safety model
+## 🔒 Safety model
 
 - `run` executes critical steps and aborts on failure; `run_soft` executes optional steps and continues with a warning.
 - Both honour `--dry-run`: the command is printed, nothing is executed.
@@ -191,18 +209,18 @@ The menu never blocks automation: it appears only when the script is started wit
 - Aggressive actions back up every file they touch to `<file>.bak_<timestamp>` (mode 600).
 - The disk-space guard refuses to start package operations on a nearly-full root partition (a `--dry-run` only warns, so previews always complete).
 
-## ⚠️ Disclaimer
+## 🚨 Disclaimer
 
 This script modifies system packages and (only when explicitly asked) system configuration files. Read it before running it, rehearse aggressive options with `--dry-run`, and keep backups of anything you cannot afford to lose. It is provided as-is under the MIT licence.
 
-## Testing
+## 🧪 Testing
 
 `test_behavior.sh` runs the script end-to-end inside a container with stubbed package managers and asserts: full-session logging, no duplicated log lines, `NEEDRESTART_MODE` propagation, the disk-space abort and dry-run-warn paths, the `rc` purge, Snap/Flatpak handling, and all three TUI degradation paths (whiptail select, Cancel → classic menu, no whiptail → classic menu). Requires root; intended for disposable environments.
 
-## Contributing
+## 🤝 Contributing
 
 Issues and pull requests are welcome — especially reports from distros or hardware I haven't tested. Please run `shellcheck` and `bash test_behavior.sh` (in a disposable VM/container) before submitting.
 
-## License
+## 📜 License
 
 MIT — see [LICENSE](LICENSE). © 2026 Abdelrahman Fekry El-Maghraby.
