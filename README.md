@@ -70,7 +70,7 @@ Run the script with no flags from a real terminal and you get a menu. If **whipt
 | Flag | What it does |
 |---|---|
 | `--repair-mirrors` | Replaces known-dead apt mirrors and restores the official repos for your detected distro (sources are backed up first). |
-| `--install-realtek` | Force-installs the out-of-tree RTL8188EUS DKMS Wi-Fi driver (TP-Link TL-WN725N and similar). |
+| `--install-realtek` | Installs the out-of-tree RTL8188EUS DKMS Wi-Fi driver **non-interactively** (apt first, then a DKMS source build from `aircrack-ng/rtl8188eus`). The driver is handled in any environment: if it's already present the run skips it; without this flag an **interactive** run prompts `[y/N]` while an **unattended** run safely skips. See [step-by-step](#-what-a-default-run-does-step-by-step). |
 | `--aggressive-network` | Forces IPv4 + raises apt retries; persists an IPv4 apt config after the first failure. |
 | `--tune-storage` | Persistent I/O scheduler (udev rule), `noatime` on root for SSDs, `vm.swappiness=10` for HDDs. |
 
@@ -130,7 +130,8 @@ sudo ./linux-maintain.sh --dry-run
 sudo ./linux-maintain.sh --dry-run --repair-mirrors
 sudo ./linux-maintain.sh --repair-mirrors --aggressive-network
 
-# Force the Realtek USB Wi-Fi driver
+# Install the Realtek USB Wi-Fi driver non-interactively (apt, then DKMS source
+# build). Without the flag, an interactive run prompts; unattended runs skip it.
 sudo ./linux-maintain.sh --install-realtek
 
 # Snapshot before upgrading, then vacuum the journal to 30 days
@@ -173,7 +174,7 @@ OPTIONAL MAINTENANCE & SECURITY (opt-in; safe-by-default is preserved):
 
 AGGRESSIVE / REPAIR OPTIONS (opt-in; modify system files; always backed up):
       --repair-mirrors     Replace dead apt mirrors, restore official repos
-      --install-realtek    Force the RTL8188EUS DKMS Wi-Fi driver
+      --install-realtek    Install the RTL8188EUS DKMS driver non-interactively (apt, then source build)
       --aggressive-network Force IPv4 + more retries; persist IPv4 on failure
       --tune-storage       Persistent I/O scheduler, noatime (SSD), swappiness (HDD)
 
@@ -201,6 +202,8 @@ ENVIRONMENT (failure/abort alerts for unattended runs):
 12. Rotates old logs, prints a summary, and tells you if a reboot is needed.
 
 Opt-in steps slot into this flow when their flags are present: a `/etc` archive and `--repair-mirrors` run before the upgrade (step 3–4); `--snapshot` runs just before the upgrade itself; `--clean-docker` and `--vacuum-journal` run in the cleanup phase (step 9); and `--audit-perms` adds a SUID/world-writable scan to the security summary (step 11).
+
+The **Realtek RTL8188EUS Wi-Fi driver** is handled as its own step after the driver stage, in **any** environment (no hardware probe, no bare-metal restriction): it is skipped if the `8188eu` module is already present; installed when `--install-realtek` is given; otherwise an interactive run prompts `[y/N]` and an unattended run safely skips it (pass `--install-realtek` to install unattended). Passing `--no-drivers` suppresses this step entirely and overrides `--install-realtek` (a contradictory combination), honouring the explicit intent to avoid driver changes. Installation tries the `realtek-rtl8188eus-dkms` apt package first and, if it isn't packaged (typical on Debian/Ubuntu), automatically builds it from `aircrack-ng/rtl8188eus` via DKMS. All of this respects `--dry-run`.
 
 ---
 
@@ -299,7 +302,7 @@ This script modifies system packages and (only when explicitly asked) system con
 
 ## 🧪 Testing
 
-`test_behavior.sh` runs the script end-to-end inside a container with stubbed package managers (68 assertions across 12 groups). It asserts: full-session logging, no duplicated log lines, `NEEDRESTART_MODE` propagation, the disk-space abort and dry-run-warn paths, the `rc` purge, Snap/Flatpak handling, and all three TUI degradation paths (whiptail select, Cancel → classic menu, no whiptail → classic menu). The 3.2.0 additions cover: new flag parsing and menu option 6, journal-vacuum time-vs-size routing, the docker prune tiers (safe set, destructive volumes, daemon-down, absent), the SSH posture check (insecure flagged, hardened clean, commented directives ignored), the attack-surface report output, the privesc audit (planted SUID + world-writable items, running cleanly under `set -e`), the `/etc` archive (root-only tarball + dry-run preview), the snapshot paths (dry-run preview, Timeshift success, fail-closed abort), the Discord rich-embed payload (valid JSON with all required fields, even when the reason contains quotes/backslashes/newlines/UTF-8) versus Telegram plain text, and an end-to-end check that a disk-guard abort fires a valid embed alert. Requires root; intended for disposable environments.
+`test_behavior.sh` runs the script end-to-end inside a container with stubbed package managers (86 assertions across 13 groups). It asserts: full-session logging, no duplicated log lines, `NEEDRESTART_MODE` propagation, the disk-space abort and dry-run-warn paths, the `rc` purge, Snap/Flatpak handling, and all three TUI degradation paths (whiptail select, Cancel → classic menu, no whiptail → classic menu). The 3.2.0 additions cover: new flag parsing and menu option 6, journal-vacuum time-vs-size routing, the docker prune tiers (safe set, destructive volumes, daemon-down, absent), the SSH posture check (insecure flagged, hardened clean, commented directives ignored), the attack-surface report output, the privesc audit (planted SUID + world-writable items, running cleanly under `set -e`), the `/etc` archive (root-only tarball + dry-run preview), the snapshot paths (dry-run preview, Timeshift success, fail-closed abort), the Discord rich-embed payload (valid JSON with all required fields, even when the reason contains quotes/backslashes/newlines/UTF-8) versus Telegram plain text, an end-to-end check that a disk-guard abort fires a valid embed alert, and the full Realtek flow (idempotency skip, forced install, interactive `y`/default-`N`, unattended safe-skip, dry-run preview, the `--no-drivers` suppression (incl. overriding `--install-realtek`), the `can_prompt` TTY/`--yes` gate, and the apt-first → DKMS-source fallback with name/version parsed from the cloned `dkms.conf`). Requires root; intended for disposable environments.
 
 ## 🤝 Contributing
 

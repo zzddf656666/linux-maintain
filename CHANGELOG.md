@@ -49,15 +49,28 @@ restarts no network. Every new heavyweight or destructive action is opt-in.
   password authentication; never modifies the file.
 - Interactive menu option **6) Security Audit** (safe maintenance plus the
   privilege-escalation audit).
-- `test_behavior.sh`: nine new test groups (flag parsing, menu option 6,
+- `test_behavior.sh`: ten new test groups (flag parsing, menu option 6,
   journal-vacuum routing, docker tiers, SSH posture, attack surface, privesc
-  audit, /etc archive, snapshot abort/success, and an end-to-end disk-guard →
-  Discord alert with a valid rich-embed payload), 68 assertions total.
+  audit, /etc archive, snapshot abort/success, an end-to-end disk-guard →
+  Discord alert with a valid rich-embed payload, and the full Realtek flow),
+  86 assertions total.
 
 ### Changed
 - The ERR trap and `die()` now record a failure context that the EXIT trap uses
   to send a single alert. `ssh_posture_check` and `audit_permissions` honour the
   optional `SSHD_CONFIG` and `AUDIT_PATHS` overrides. Version bumped to 3.2.0.
+- **Realtek RTL8188EUS handling reworked** into a safe-by-default flow. The
+  previous `lsusb` hardware-detection and bare-metal gate were removed in favour
+  of an idempotent, environment-independent step: skip if the `8188eu` module is
+  already present; install when `--install-realtek` is given; otherwise prompt
+  `[y/N]` on an interactive terminal and safely skip when unattended (cron/`--yes`
+  without the flag). Installation now tries the `realtek-rtl8188eus-dkms` apt
+  package first and **falls back to building from `aircrack-ng/rtl8188eus` via
+  DKMS** when it isn't packaged (typical on Debian/Ubuntu) — name and version are
+  read from the cloned `dkms.conf` (never hardcoded), the HTTPS clone is
+  pinnable/mirrorable via `RTL8188EUS_REPO` / `RTL8188EUS_REF`, and the whole
+  step honours `--dry-run` and never aborts the run. `--no-drivers` suppresses
+  the step entirely and overrides `--install-realtek`.
 
 ### Unchanged (guaranteed)
 - All pre-existing CLI flags, their semantics, and the step order of a default

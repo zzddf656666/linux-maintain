@@ -614,8 +614,10 @@ OPTIONAL MAINTENANCE & SECURITY (opt-in; safe-by-default is preserved):
 AGGRESSIVE / REPAIR OPTIONS (opt-in; modify system files; always backed up):
       --repair-mirrors     Replace dead apt mirrors and restore official repos
                            for the detected distro (backs up sources first)
-      --install-realtek    Force-install the out-of-tree RTL8188EUS DKMS Wi-Fi
-                           driver (for TP-Link TL-WN725N and similar adapters)
+      --install-realtek    Install the out-of-tree RTL8188EUS DKMS Wi-Fi driver
+                           non-interactively (apt first, then a DKMS build from
+                           aircrack-ng/rtl8188eus). Without this flag an
+                           interactive run PROMPTS; unattended runs skip it.
       --aggressive-network Force IPv4 + raise apt retries; on first failure,
                            write a persistent IPv4 config for apt
       --tune-storage       Deep storage tuning: persistent I/O scheduler (udev),
@@ -793,13 +795,175 @@ repair_mirrors() {
 }
 
 # =========================================================================== #
-#  Aggressive fix: force-install Realtek RTL8188EUS DKMS driver
+#  Realtek RTL8188EUS DKMS driver
+#    Safe-by-default flow (no hardware probing, any environment):
+#      0. if --no-drivers -> suppress entirely (overrides --install-realtek)
+#      1. else if the 8188eu module is already present -> log and skip
+#      2. else if --install-realtek -> install (apt, then DKMS source fallback)
+#      3. else if interactive (TTY, not --yes) -> prompt [y/N]
+#      4. else (unattended) -> skip safely; --install-realtek is required
+#    Everything honours --dry-run.
 # =========================================================================== #
+# Interactive only when attached to a real terminal AND not in --yes mode.
+realtek_can_prompt() {
+  [[ $ASSUME_YES == false ]] && [[ -t 0 ]]
+}
+
+# Decide whether to install the Realtek driver, then hand off to the worker.
+realtek_stage() {
+  log_step "Realtek RTL8188EUS Wi-Fi driver"
+
+  # (0) --no-drivers is an explicit "do not touch drivers" intent: suppress the
+  # Realtek prompt/install entirely. It overrides --install-realtek (a
+  # contradictory combination) so the safe, explicit request always wins.
+  if [[ $DO_DRIVERS == false ]]; then
+    if [[ $DO_INSTALL_REALTEK == true ]]; then
+      log_warn "--no-drivers overrides --install-realtek; skipping the Realtek driver."
+    else
+      log_info "--no-drivers given; skipping the Realtek driver."
+    fi
+    return 0
+  fi
+
+  # (1) Idempotency: already installed -> nothing to do.
+  if realtek_driver_present; then
+    log_ok "RTL8188EUS driver (module 8188eu) already present; skipping."
+    return 0
+  fi
+
+  # (2) Explicit request: install without prompting (any environment).
+  if [[ $DO_INSTALL_REALTEK == true ]]; then
+    log_info "Driver not present and --install-realtek given; installing."
+    install_realtek_driver
+    return 0
+  fi
+
+  # In --dry-run we never prompt; we describe what a real run would do.
+  if [[ $DRY_RUN == true ]]; then
+    log_info "(dry run) RTL8188EUS driver (8188eu) not present."
+    log_info "(dry run) an interactive run would prompt [y/N]; --install-realtek would install it now."
+    return 0
+  fi
+
+  # (3) Interactive: ask. (4) Unattended without the flag: safe-skip.
+  if realtek_can_prompt; then
+    local reply=""
+    printf '%b' "${C_YLW:-}"
+    read -rp "  [?] Realtek Wi-Fi driver (8188eu) not found. Install it now? [y/N]: " reply || reply=""
+    printf '%b' "${C_RESET:-}"
+    case "${reply,,}" in
+      y|yes) install_realtek_driver ;;
+      *)     log_info "Skipping Realtek driver installation (declined)." ;;
+    esac
+  else
+    log_info "Unattended run without --install-realtek; skipping Realtek driver (safe default)."
+    log_info "Pass --install-realtek to install it in unattended runs."
+  fi
+  return 0
+}
+
 install_realtek_driver() {
-  log_step "Installing Realtek RTL8188EUS DKMS driver (--install-realtek)"
-  apt_install build-essential dkms "linux-headers-$(uname -r)"
-  apt_install realtek-rtl8188eus-dkms
-  log_ok "Realtek RTL8188EUS DKMS step complete (a reboot or 'modprobe 8188eu' may be needed)."
+  log_info "Installing the Realtek RTL8188EUS DKMS Wi-Fi driver."
+  apt_install build-essential dkms git "linux-headers-$(uname -r)"
+
+  if realtek_driver_present; then
+    log_ok "RTL8188EUS DKMS driver already present; nothing to do."
+    return 0
+  fi
+
+  # Prefer the packaged DKMS driver when the distro ships it (e.g. Kali).
+  if apt-cache show realtek-rtl8188eus-dkms >/dev/null 2>&1; then
+    apt_install realtek-rtl8188eus-dkms
+  else
+    log_info "realtek-rtl8188eus-dkms is not in apt on this distro (normal on Debian/Ubuntu)."
+  fi
+
+  # Fallback: build from upstream source if the package didn't provide a module.
+  if ! realtek_driver_present; then
+    log_info "Falling back to a source build from aircrack-ng/rtl8188eus."
+    build_realtek_from_source || true
+  fi
+
+  if [[ $DRY_RUN == true ]]; then
+    log_info "(dry run) RTL8188EUS install/build steps previewed above."
+    return 0
+  fi
+  if realtek_driver_present; then
+    log_ok "RTL8188EUS ready (a reboot or 'sudo modprobe 8188eu' may be needed)."
+  else
+    log_warn "RTL8188EUS driver could not be installed (package missing and source build failed); see the log."
+  fi
+  return 0
+}
+
+# True if a 8188eu / realtek-rtl8188eus module is registered with DKMS or is
+# already available to the running kernel.
+realtek_driver_present() {
+  if have dkms && dkms status 2>/dev/null | grep -qiE 'realtek-rtl8188eus|8188eu'; then return 0; fi
+  if modinfo 8188eu >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+# Fallback: build + register the RTL8188EUS driver from source via DKMS, for
+# distros where realtek-rtl8188eus-dkms is not packaged (Debian/Ubuntu). The
+# clone is over HTTPS; the repo/ref are overridable for pinning or mirroring:
+#   RTL8188EUS_REPO  (default: https://github.com/aircrack-ng/rtl8188eus)
+#   RTL8188EUS_REF   (optional commit/tag to pin for a reproducible build)
+# Module identity (name/version) is read from the cloned dkms.conf, never
+# hardcoded, so it tracks upstream. Honours --dry-run and never aborts the run.
+build_realtek_from_source() {
+  local repo="${RTL8188EUS_REPO:-https://github.com/aircrack-ng/rtl8188eus}"
+  local ref="${RTL8188EUS_REF:-}"
+
+  if [[ $DRY_RUN == true ]]; then
+    log_cmd "would git clone --depth 1 ${ref:+--branch ${ref} }-- ${repo} <tmp>"
+    log_cmd "would dkms add/build/install using the cloned dkms.conf (module: 8188eu)"
+    return 0
+  fi
+
+  have git  || { log_warn "git is unavailable; cannot build RTL8188EUS from source.";  return 1; }
+  have dkms || { log_warn "dkms is unavailable; cannot build RTL8188EUS from source."; return 1; }
+
+  local src
+  src="$(mktemp -d "${TMPDIR:-/tmp}/rtl8188eus.XXXXXX")" || { log_warn "mktemp failed; skipping source build."; return 1; }
+
+  # Transport-secure clone; '--' guards against an option-like repo value.
+  if [[ -n $ref ]]; then
+    run_soft git clone --depth 1 --branch "$ref" -- "$repo" "$src"
+  else
+    run_soft git clone --depth 1 -- "$repo" "$src"
+  fi
+  if [[ ! -f "$src/dkms.conf" ]]; then
+    log_warn "Cloned tree has no dkms.conf (clone failed or unexpected repo: ${repo})."
+    rm -rf "$src" 2>/dev/null || true
+    return 1
+  fi
+
+  local name ver
+  name="$(awk -F\" '/^PACKAGE_NAME=/{print $2; exit}'    "$src/dkms.conf" 2>/dev/null || true)"
+  ver="$( awk -F\" '/^PACKAGE_VERSION=/{print $2; exit}' "$src/dkms.conf" 2>/dev/null || true)"
+  if [[ -z $name || -z $ver ]]; then
+    log_warn "Could not parse PACKAGE_NAME/PACKAGE_VERSION from dkms.conf; skipping source build."
+    rm -rf "$src" 2>/dev/null || true
+    return 1
+  fi
+  log_info "Building ${name} ${ver} via DKMS (module 8188eu)."
+
+  local destsrc="/usr/src/${name}-${ver}"
+  run_soft rm -rf "$destsrc"
+  run_soft cp -a "$src" "$destsrc"
+  rm -rf "$src" 2>/dev/null || true
+
+  run_soft dkms add     -m "$name" -v "$ver"
+  run_soft dkms build   -m "$name" -v "$ver"
+  run_soft dkms install -m "$name" -v "$ver"
+
+  if realtek_driver_present; then
+    log_ok "RTL8188EUS built and installed from source via DKMS."
+    return 0
+  fi
+  log_warn "RTL8188EUS source build did not register a module (kernel headers / toolchain?)."
+  return 1
 }
 
 # =========================================================================== #
@@ -1108,14 +1272,6 @@ if [[ $DO_DRIVERS == true && $IS_BAREMETAL == true ]]; then
     apt_install xserver-xorg-video-intel intel-media-va-driver-non-free
   fi
 
-  # Auto-install the Realtek driver only if such an adapter is present AND the
-  # user did not already force it with --install-realtek (handled separately).
-  if [[ $DO_INSTALL_REALTEK == false ]] && have lsusb && lsusb 2>/dev/null | grep -qiE 'RTL8188|8188eu'; then
-    log_info "Realtek RTL8188-class USB Wi-Fi detected; installing DKMS driver."
-    apt_install "linux-headers-$(uname -r)"
-    apt_install realtek-rtl8188eus-dkms
-  fi
-
   cpu_vendor="$(lscpu 2>/dev/null | awk -F: '/Vendor ID/{gsub(/ /,"",$2); print tolower($2); exit}' || echo '')"
   if [[ $cpu_vendor == *intel* ]]; then
     apt_install intel-microcode
@@ -1128,8 +1284,10 @@ else
   log_step "Skipping bare-metal drivers (VM detected or --no-drivers given)"
 fi
 
-# Forced Realtek install runs in any environment when explicitly requested.
-[[ $DO_INSTALL_REALTEK == true ]] && install_realtek_driver
+# Realtek RTL8188EUS driver: runs in ANY environment (no hardware probe, no
+# bare-metal restriction). Skips if already installed; installs when forced with
+# --install-realtek; otherwise prompts interactively and safe-skips unattended.
+realtek_stage
 
 # =========================================================================== #
 #  Guest tools inside a VM / Hyper-V / WSL

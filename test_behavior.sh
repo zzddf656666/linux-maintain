@@ -586,6 +586,143 @@ grep -q "below the 1024 MB safety minimum" /tmp/e2e_out.txt \
   && ok "abort reason is logged before the alert" || bad "abort reason missing from output"
 rm -f "$STUB/df" "$STUB/curl"
 
+# ---------------------------------------------------------------------------
+# 13) Realtek RTL8188EUS: hardware auto-detection + robust install path
+# ---------------------------------------------------------------------------
+echo "== Test 13: Realtek safe-by-default flow (idempotent / forced / prompt / unattended) =="
+sed -n '/^realtek_can_prompt()/,/^}/p'        linux-maintain.sh > /tmp/rtl_canprompt.sh
+sed -n '/^realtek_stage()/,/^}/p'             linux-maintain.sh > /tmp/rtl_stage.sh
+sed -n '/^install_realtek_driver()/,/^}/p'    linux-maintain.sh > /tmp/rtl_install.sh
+sed -n '/^build_realtek_from_source()/,/^}/p' linux-maintain.sh > /tmp/rtl_build.sh
+
+# ---- realtek_stage decision tree (present/can_prompt/install stubbed out) ----
+stage_run() {  # env: RTL_PRESENT FORCE DRY CANPROMPT DRIVERS ; stdin: REPLY_IN
+  printf '%s' "${REPLY_IN:-}" | \
+  RTL_PRESENT="${RTL_PRESENT:-0}" FORCE="${FORCE:-false}" DRY="${DRY:-false}" CANPROMPT="${CANPROMPT:-0}" DRIVERS="${DRIVERS:-true}" \
+  bash -c '
+    set -Eeuo pipefail
+    ASSUME_YES=false; DO_INSTALL_REALTEK="$FORCE"; DRY_RUN="$DRY"; DO_DRIVERS="$DRIVERS"
+    log_step(){ :; }; log_ok(){ echo "OK:$*"; }; log_info(){ echo "INFO:$*"; }; log_warn(){ echo "WARN:$*"; }
+    realtek_driver_present(){ [[ "$RTL_PRESENT" == 1 ]]; }
+    realtek_can_prompt(){ [[ "$CANPROMPT" == 1 ]]; }
+    install_realtek_driver(){ echo "INSTALL-CALLED"; }
+    source /tmp/rtl_stage.sh
+    realtek_stage' 2>/dev/null
+}
+out=$(RTL_PRESENT=1 stage_run)
+{ echo "$out" | grep -q "already present" && ! echo "$out" | grep -q "INSTALL-CALLED"; } \
+  && ok "(1) idempotency: present -> logs present, skips install" || bad "idempotency wrong: $out"
+out=$(RTL_PRESENT=0 FORCE=true stage_run)
+echo "$out" | grep -q "INSTALL-CALLED" \
+  && ok "(2) --install-realtek installs without prompting" || bad "forced path wrong: $out"
+out=$(RTL_PRESENT=0 CANPROMPT=1 REPLY_IN=$'y\n' stage_run)
+echo "$out" | grep -q "INSTALL-CALLED" \
+  && ok "(3) interactive prompt + 'y' installs" || bad "prompt-yes wrong: $out"
+out=$(RTL_PRESENT=0 CANPROMPT=1 REPLY_IN=$'\n' stage_run)
+{ ! echo "$out" | grep -q "INSTALL-CALLED" && echo "$out" | grep -qi "declined"; } \
+  && ok "(3b) interactive prompt + Enter defaults to No (skip)" || bad "prompt-no wrong: $out"
+out=$(RTL_PRESENT=0 CANPROMPT=0 stage_run)
+{ ! echo "$out" | grep -q "INSTALL-CALLED" && echo "$out" | grep -qi "safe default"; } \
+  && ok "(5) unattended without --install-realtek -> safe skip" || bad "unattended-skip wrong: $out"
+out=$(RTL_PRESENT=0 DRY=true CANPROMPT=1 stage_run)
+{ ! echo "$out" | grep -q "INSTALL-CALLED" && echo "$out" | grep -q "would prompt"; } \
+  && ok "(6) dry-run (not forced) previews, never installs" || bad "dry-run-stage wrong: $out"
+out=$(RTL_PRESENT=0 FORCE=true DRY=true stage_run)
+echo "$out" | grep -q "INSTALL-CALLED" \
+  && ok "(6b) dry-run + --install-realtek hands off to the dry-aware installer" || bad "dry-forced wrong: $out"
+out=$(RTL_PRESENT=0 DRIVERS=false CANPROMPT=1 REPLY_IN=$'y\n' stage_run)
+{ ! echo "$out" | grep -q "INSTALL-CALLED" && echo "$out" | grep -q -- "--no-drivers given"; } \
+  && ok "(0) --no-drivers suppresses the prompt and skips entirely" || bad "no-drivers guard wrong: $out"
+out=$(RTL_PRESENT=0 DRIVERS=false FORCE=true stage_run)
+{ ! echo "$out" | grep -q "INSTALL-CALLED" && echo "$out" | grep -q -- "--no-drivers overrides --install-realtek"; } \
+  && ok "(0b) --no-drivers overrides --install-realtek (warns, skips)" || bad "no-drivers override wrong: $out"
+
+# ---- realtek_can_prompt (the real TTY/assume-yes gate) ----
+r=$(ASSUME_YES=true  bash -c 'set -e; source /tmp/rtl_canprompt.sh; realtek_can_prompt && echo Y || echo N')
+[[ $r == N ]] && ok "can_prompt: --yes -> never prompts" || bad "can_prompt assume-yes wrong: $r"
+r=$(printf '' | ASSUME_YES=false bash -c 'set -e; source /tmp/rtl_canprompt.sh; realtek_can_prompt && echo Y || echo N')
+[[ $r == N ]] && ok "can_prompt: no TTY on stdin -> never prompts" || bad "can_prompt no-tty wrong: $r"
+
+# ---- install_realtek_driver: apt first, DKMS source fallback ----
+rm -f /tmp/rtl_installed; : > /tmp/rtl_apt.log
+out=$(bash -c '
+  set -Eeuo pipefail; DRY_RUN=false
+  log_step(){ :; }; log_info(){ echo "INFO:$*"; }; log_ok(){ :; }; log_warn(){ echo "WARN:$*"; }; log_cmd(){ :; }
+  have(){ command -v "$1" >/dev/null 2>&1; }; run_soft(){ "$@" || true; }
+  apt-cache(){ return 1; }                                  # package NOT in repos
+  apt_install(){ echo "apt_install: $*" >> /tmp/rtl_apt.log; }
+  realtek_driver_present(){ [[ -e /tmp/rtl_installed ]]; } # stays absent
+  build_realtek_from_source(){ echo "BUILD-CALLED"; }
+  source /tmp/rtl_install.sh; install_realtek_driver')
+{ echo "$out" | grep -q "BUILD-CALLED" && echo "$out" | grep -qi "not in apt"; } \
+  && ok "(4) package missing -> DKMS source fallback is triggered" || bad "fallback wrong: $out"
+grep -q "apt_install: build-essential dkms git linux-headers-" /tmp/rtl_apt.log \
+  && ok "install pulls build-essential + dkms + git + headers" || bad "toolchain missing: $(cat /tmp/rtl_apt.log)"
+
+rm -f /tmp/rtl_installed; : > /tmp/rtl_apt.log
+out=$(bash -c '
+  set -Eeuo pipefail; DRY_RUN=false
+  log_step(){ :; }; log_info(){ :; }; log_ok(){ :; }; log_warn(){ :; }; log_cmd(){ :; }
+  have(){ command -v "$1" >/dev/null 2>&1; }; run_soft(){ "$@" || true; }
+  apt-cache(){ return 0; }                                  # package IS in repos
+  apt_install(){ echo "apt_install: $*" >> /tmp/rtl_apt.log; case "$*" in *realtek-rtl8188eus-dkms*) touch /tmp/rtl_installed;; esac; }
+  realtek_driver_present(){ [[ -e /tmp/rtl_installed ]]; } # becomes present after apt
+  build_realtek_from_source(){ echo "BUILD-CALLED"; }
+  source /tmp/rtl_install.sh; install_realtek_driver')
+{ ! echo "$out" | grep -q "BUILD-CALLED" && grep -q "apt_install: realtek-rtl8188eus-dkms" /tmp/rtl_apt.log; } \
+  && ok "apt success short-circuits the source build (no fallback)" || bad "apt-success path wrong: $out / $(cat /tmp/rtl_apt.log)"
+rm -f /tmp/rtl_installed
+
+# ---- build_realtek_from_source: git+dkms sequence (and dry-run safety) ----
+cat > "$STUB/git" <<'EOF'
+#!/usr/bin/env bash
+echo "git: $*" >> /tmp/rtl_git.log
+if [[ "$1" == clone ]]; then
+  dest="${!#}"; mkdir -p "$dest"
+  printf 'PACKAGE_NAME="realtek-rtl8188eus"\nPACKAGE_VERSION="0.0~test"\nBUILT_MODULE_NAME[0]=8188eu\n' > "$dest/dkms.conf"
+  : > "$dest/Makefile"
+fi
+exit 0
+EOF
+cat > "$STUB/dkms" <<'EOF'
+#!/usr/bin/env bash
+echo "dkms: $*" >> /tmp/rtl_dkms.log
+exit 0
+EOF
+cat > "$STUB/modinfo" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$STUB/git" "$STUB/dkms" "$STUB/modinfo"
+
+# dry-run: previews, runs nothing
+: > /tmp/rtl_git.log
+out=$(PATH="$STUB:$PATH" bash -c '
+  set -Eeuo pipefail; DRY_RUN=true
+  log_step(){ :; }; log_info(){ :; }; log_ok(){ :; }; log_warn(){ :; }; log_cmd(){ echo "CMD:$*"; }
+  have(){ command -v "$1" >/dev/null 2>&1; }; run_soft(){ "$@"; }
+  source /tmp/rtl_build.sh; build_realtek_from_source')
+{ echo "$out" | grep -q "would git clone" && [[ ! -s /tmp/rtl_git.log ]]; } \
+  && ok "source build dry-run previews clone+dkms, runs nothing" || bad "dry build wrong: $out / $(cat /tmp/rtl_git.log)"
+
+# real: clone + dkms add/build/install using name/version from dkms.conf
+: > /tmp/rtl_git.log; : > /tmp/rtl_dkms.log
+out=$(PATH="$STUB:$PATH" RTL8188EUS_REPO="https://example.invalid/rtl8188eus" bash -c '
+  set -Eeuo pipefail; DRY_RUN=false
+  log_step(){ :; }; log_info(){ echo "INFO:$*"; }; log_ok(){ echo "OK:$*"; }; log_warn(){ echo "WARN:$*"; }; log_cmd(){ :; }
+  have(){ command -v "$1" >/dev/null 2>&1; }; run_soft(){ "$@" || true; }
+  realtek_driver_present(){ return 1; }
+  source /tmp/rtl_build.sh; build_realtek_from_source')
+grep -q "git: clone" /tmp/rtl_git.log \
+  && ok "source build clones over HTTPS git" || bad "clone not invoked: $(cat /tmp/rtl_git.log)"
+grep -q "dkms: add -m realtek-rtl8188eus -v 0.0~test" /tmp/rtl_dkms.log \
+  && ok "dkms add uses name/version parsed from dkms.conf (not hardcoded)" || bad "dkms add wrong: $(cat /tmp/rtl_dkms.log)"
+{ grep -q "dkms: build -m realtek-rtl8188eus -v 0.0~test" /tmp/rtl_dkms.log \
+  && grep -q "dkms: install -m realtek-rtl8188eus -v 0.0~test" /tmp/rtl_dkms.log; } \
+  && ok "dkms build + install invoked for the parsed module" || bad "dkms build/install wrong: $(cat /tmp/rtl_dkms.log)"
+rm -rf "/usr/src/realtek-rtl8188eus-0.0~test"
+rm -f "$STUB/git" "$STUB/dkms" "$STUB/modinfo"
+
 echo ""
 echo "RESULTS: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
