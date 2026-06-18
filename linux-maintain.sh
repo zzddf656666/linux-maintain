@@ -23,7 +23,7 @@ set -Eeuo pipefail
 # =========================================================================== #
 #  Constants & defaults
 # =========================================================================== #
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.2.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly START_STAMP="$(date +'%Y-%m-%d_%H-%M-%S')"
 
@@ -42,6 +42,29 @@ DO_REPAIR_MIRRORS=false     # --repair-mirrors     : smart mirror auto-repair
 DO_INSTALL_REALTEK=false    # --install-realtek    : force RTL8188EUS DKMS driver
 AGGRESSIVE_NET=false        # --aggressive-network : persistent IPv4 + more retries
 
+# --- Opt-in maintenance / security features (new in 3.2.0) ----------------- #
+DO_SNAPSHOT=false             # --snapshot               : Timeshift/BTRFS snapshot before upgrade
+DO_CLEAN_DOCKER=false         # --clean-docker           : docker system prune (safe set)
+DO_CLEAN_DOCKER_VOLUMES=false # --clean-docker-volumes   : also prune unused volumes (DESTRUCTIVE)
+DO_BACKUP_ETC=false           # --backup-etc             : compressed /etc archive
+JOURNAL_VACUUM=false          # --vacuum-journal[=SPEC]  : vacuum the systemd journal
+JOURNAL_VACUUM_SPEC="14d"     #                            default age; SPEC like 30d or 500M
+DO_AUDIT_PERMS=false          # --audit-perms            : SUID/SGID + world-writable scan
+WANTS_AGGRESSIVE=false        # set true if any aggressive flag is active (gates the /etc archive)
+
+# --- Failure notifications (configured via ENVIRONMENT, never via CLI) ------ #
+#   Secrets on the command line are visible in `ps`; we read them from the
+#   environment instead (use a systemd EnvironmentFile= for unattended timers).
+#     MAINTAIN_DISCORD_WEBHOOK   full Discord webhook URL
+#     MAINTAIN_TELEGRAM_TOKEN    Telegram bot token
+#     MAINTAIN_TELEGRAM_CHAT     Telegram chat id
+DISCORD_WEBHOOK="${MAINTAIN_DISCORD_WEBHOOK:-}"
+TELEGRAM_TOKEN="${MAINTAIN_TELEGRAM_TOKEN:-}"
+TELEGRAM_CHAT="${MAINTAIN_TELEGRAM_CHAT:-}"
+NOTIFY_ARMED=false            # true once we are past pre-flight (real maintenance)
+NOTIFY_DONE=false             # ensures a single failure alert
+FAILURE_CONTEXT=""            # populated by die()/ERR for the alert body
+
 readonly APT_RETRIES_DEFAULT=3
 readonly APT_RETRIES_AGGRESSIVE=8
 
@@ -56,6 +79,8 @@ BAD_MIRROR_HOSTS=(
 )
 
 LOGFILE=""                  # set after we confirm we are root
+LOGDIR=""                   # log/report/backup destination (resolved at runtime)
+REPORT=""                   # system-report path (set when logging is active)
 EXEC_LOG_ACTIVE=false       # true once exec>tee captures all output (full logging)
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a   # auto-restart services; never block on needrestart prompts
@@ -98,11 +123,130 @@ log_err()  { _log_line "[x]  $*" "$C_RED"; }
 log_cmd()  { _log_line "       \$ $*" "$C_DIM"; }
 log_step() { _log_line ""; _log_line "==> $*" "${C_BOLD}${C_CYN}"; }
 
-die() { log_err "$*"; exit 1; }
+# =========================================================================== #
+#  Failure-notification helpers
+#    Alerts are OFF unless a webhook/token is present in the environment.
+#    notify_failure() is safe to call from traps: it never throws, honours
+#    --dry-run, and no-ops when nothing is configured.
+# =========================================================================== #
+# JSON string escaper. Escapes the JSON-significant characters and strips
+# control characters (except TAB/CR/LF, which become \t \r \n) so hand-built
+# payloads stay valid even when the reason or log tail contains quotes,
+# backslashes, ANSI escapes, or newlines. Valid UTF-8 (e.g. the em-dash in our
+# own messages) is preserved.
+_json_escape() {
+  local s="${1:-}"
+  s="$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' 2>/dev/null || true)"
+  s="${s//\\/\\\\}"     # backslash (must be first)
+  s="${s//\"/\\\"}"     # double quote
+  s="${s//$'\r'/\\r}"   # CR  -> \r
+  s="${s//$'\n'/\\n}"   # LF  -> \n
+  s="${s//$'\t'/\\t}"   # TAB -> \t
+  printf '%s' "$s"
+}
+
+# Build a Discord rich-embed payload: a red embed with structured fields
+# (Hostname, Exit Code, Version, Trigger/Reason, Timestamp, and a log tail).
+# Every interpolated value is JSON-escaped; color 15548997 == #ED4245 (red).
+_discord_embed_payload() {  # $1=host $2=rc $3=reason $4=iso8601 $5=fenced-log
+  printf '{"username":"linux-maintain","embeds":[{"title":"🚨 Maintenance Run Failed","description":"An unattended **linux-maintain** run exited abnormally and needs attention.","color":15548997,"fields":[{"name":"Hostname","value":"%s","inline":true},{"name":"Exit Code","value":"%s","inline":true},{"name":"Version","value":"%s","inline":true},{"name":"Trigger / Reason","value":"%s","inline":false},{"name":"Timestamp (UTC)","value":"%s","inline":false},{"name":"Log (tail)","value":"%s","inline":false}],"footer":{"text":"linux-maintain v%s • automated maintenance"},"timestamp":"%s"}]}' \
+    "$(_json_escape "$1")" \
+    "$(_json_escape "$2")" \
+    "$(_json_escape "$SCRIPT_VERSION")" \
+    "$(_json_escape "$3")" \
+    "$(_json_escape "$4")" \
+    "$(_json_escape "$5")" \
+    "$(_json_escape "$SCRIPT_VERSION")" \
+    "$(_json_escape "$4")"
+}
+
+notify_failure() {
+  local rc="${1:-?}" ctx="${2:-unknown}"
+  if [[ -z $DISCORD_WEBHOOK && ( -z $TELEGRAM_TOKEN || -z $TELEGRAM_CHAT ) ]]; then
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    log_warn "Failure notification is configured but curl is missing; cannot send alert."
+    return 0
+  fi
+
+  local host iso when
+  host="$(hostname 2>/dev/null || echo unknown)"
+  iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"; [[ -n $iso ]] || iso="1970-01-01T00:00:00Z"
+  when="$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "$iso")"
+  ctx="${ctx:0:1000}"   # field values cap at 1024 chars; keep headroom
+
+  # Plain-text body (used by Telegram and the dry-run preview).
+  local msg
+  msg="[FAILED] linux-maintain ${SCRIPT_VERSION} on ${host}
+Time   : ${when}
+Reason : ${ctx}
+Log    : ${LOGFILE:-<none>}"
+
+  if [[ $DRY_RUN == true ]]; then
+    log_info "(dry run) would send a failure notification (Discord: rich embed; Telegram: text):"
+    printf '%s\n' "$msg" | sed 's/^/         | /'
+    return 0
+  fi
+
+  # ---- Discord: professional rich embed (red, structured fields) --------- #
+  if [[ -n $DISCORD_WEBHOOK ]]; then
+    local snip fenced payload
+    snip=""
+    if [[ -n ${LOGFILE:-} && -r ${LOGFILE:-/nonexistent} ]]; then
+      # last lines, ANSI stripped, forced to printable ASCII (keeps JSON valid
+      # regardless of locale / multibyte boundaries), then byte-capped.
+      snip="$(tail -n 12 "$LOGFILE" 2>/dev/null \
+                | sed -E 's/\x1b\[[0-9;]*m//g' \
+                | LC_ALL=C tr -cd '\11\12\15\40-\176' \
+                | tail -c 900 || true)"
+    fi
+    [[ -n ${snip//[$'\n\t ']/} ]] || snip="(no log output captured)"
+    fenced="$(printf '```\n%s\n```' "$snip")"
+    payload="$(_discord_embed_payload "$host" "$rc" "$ctx" "$iso" "$fenced")"
+    if curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1; then
+      log_ok "Failure alert sent to Discord (rich embed)."
+    else
+      log_warn "Could not send Discord failure alert."
+    fi
+  fi
+
+  # ---- Telegram: simple text (its formatting is intentionally minimal) --- #
+  if [[ -n $TELEGRAM_TOKEN && -n $TELEGRAM_CHAT ]]; then
+    if curl -fsS -m 10 \
+         --data-urlencode "chat_id=${TELEGRAM_CHAT}" \
+         --data-urlencode "text=${msg}" \
+         "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" >/dev/null 2>&1; then
+      log_ok "Failure alert sent to Telegram."
+    else
+      log_warn "Could not send Telegram failure alert."
+    fi
+  fi
+}
+
+# die() records context first so the EXIT-trap alert can include the reason.
+die() { FAILURE_CONTEXT="$*"; log_err "$*"; exit 1; }
 
 # Report exactly where an *unexpected* failure happened. Expected, non-fatal
 # failures go through run_soft and never reach this trap.
-trap 'rc=$?; log_err "Unexpected error (exit $rc) at line ${LINENO}: ${BASH_COMMAND}"; exit $rc' ERR
+_on_err() {
+  local rc=$?
+  FAILURE_CONTEXT="exit ${rc} at line ${BASH_LINENO[0]:-?}: ${BASH_COMMAND}"
+  log_err "Unexpected error (exit ${rc}) at line ${BASH_LINENO[0]:-?}: ${BASH_COMMAND}"
+  exit "$rc"
+}
+trap _on_err ERR
+
+# On any non-zero exit AFTER pre-flight, fire a single failure notification.
+_on_exit() {
+  local rc=$?
+  if [[ $NOTIFY_DONE == false && $NOTIFY_ARMED == true ]] && (( rc != 0 )); then
+    NOTIFY_DONE=true
+    notify_failure "$rc" "${FAILURE_CONTEXT:-aborted (exit ${rc})}" || true
+  fi
+  return 0
+}
+trap _on_exit EXIT
 
 # =========================================================================== #
 #  Core runners & helpers
@@ -162,6 +306,272 @@ write_file() {
 osr() { ( set +e; . /etc/os-release >/dev/null 2>&1; printf '%s' "${!1:-}" ); }
 
 # =========================================================================== #
+#  3.2.0 features: pre-upgrade snapshots, /etc archive, container cleanup,
+#  journal vacuum, and read-only security checks (privesc audit, attack
+#  surface, SSH posture). All honour --dry-run and the safe-by-default model.
+# =========================================================================== #
+
+# Append a line to the system report when one exists (no-op in --dry-run).
+sec_append() {
+  [[ $DRY_RUN == false && -n ${REPORT:-} && -e ${REPORT:-/nonexistent} ]] \
+    && printf '%s\n' "$*" >> "$REPORT" 2>/dev/null || true
+}
+
+# --- Pre-upgrade snapshot (Timeshift, or BTRFS via Snapper) ----------------- #
+# Opt-in (--snapshot). Because the point is a GUARANTEED rollback path, if a
+# snapshot is requested but cannot be produced we abort BEFORE any package
+# change (nothing has been modified yet) rather than upgrade unprotected.
+create_pre_upgrade_snapshot() {
+  log_step "Creating pre-upgrade system snapshot (--snapshot)"
+  local tag="linux-maintain ${SCRIPT_VERSION} pre-upgrade ${START_STAMP}"
+  local rootfs; rootfs="$(findmnt -n -o FSTYPE / 2>/dev/null || echo '')"
+
+  if [[ $DRY_RUN == true ]]; then
+    if command -v timeshift >/dev/null 2>&1; then
+      log_cmd "would run: timeshift --create --comments '${tag}' --scripted"
+    elif [[ $rootfs == btrfs ]] && command -v snapper >/dev/null 2>&1; then
+      log_cmd "would run: snapper -c root create --description '${tag}'"
+    else
+      log_warn "(dry run) no snapshot tool found; a real --snapshot run would ABORT here."
+    fi
+    return 0
+  fi
+
+  if command -v timeshift >/dev/null 2>&1; then
+    log_info "Timeshift detected; creating a tagged snapshot (this can take a while)."
+    if timeshift --create --comments "$tag" --scripted; then
+      log_ok "Timeshift snapshot created."
+      return 0
+    fi
+    log_warn "Timeshift snapshot command failed; trying BTRFS/Snapper if available."
+  fi
+
+  if [[ $rootfs == btrfs ]] && command -v snapper >/dev/null 2>&1; then
+    if snapper -c root list >/dev/null 2>&1; then
+      if snapper -c root create --description "$tag" --cleanup-algorithm number; then
+        log_ok "Snapper (BTRFS) snapshot created on config 'root'."
+        return 0
+      fi
+      log_warn "snapper create failed."
+    else
+      log_warn "snapper has no 'root' config (run: snapper -c root create-config /)."
+    fi
+  fi
+
+  die "Could not create a pre-upgrade snapshot (no working Timeshift or BTRFS/Snapper). Aborting before any package change because --snapshot guarantees a rollback path. Install/configure Timeshift (any filesystem) or Snapper (BTRFS), or re-run without --snapshot."
+}
+
+# --- Compressed /etc archive before aggressive repairs ---------------------- #
+backup_etc_archive() {
+  log_step "Archiving /etc before aggressive repairs"
+  local dest="${LOGDIR:-/var/log}"; [[ -w $dest ]] || dest="/tmp"
+  local archive="${dest}/etc-backup_${START_STAMP}.tar.gz"
+  if [[ $DRY_RUN == true ]]; then
+    log_cmd "would archive /etc -> ${archive} (tar czf, then chmod 600)"
+    return 0
+  fi
+  local rc=0
+  log_cmd "tar czf ${archive} -C / etc"
+  tar czf "$archive" --warning=no-file-changed -C / etc 2>/dev/null || rc=$?
+  if (( rc <= 1 )) && [[ -s $archive ]]; then
+    chmod 600 "$archive" 2>/dev/null || true   # /etc holds shadow & ssh keys -> root-only
+    log_ok "Configuration archive: ${archive} ($(du -h "$archive" 2>/dev/null | awk '{print $1}'))"
+  else
+    log_warn "Could not create the /etc archive cleanly (tar rc=${rc}); continuing."
+  fi
+}
+
+# --- Container cleanup (opt-in --clean-docker / --clean-docker-volumes) ------ #
+clean_docker() {
+  log_step "Pruning Docker resources (--clean-docker)"
+  if ! command -v docker >/dev/null 2>&1; then
+    log_info "docker not installed; skipping container cleanup."
+    return 0
+  fi
+  if [[ $DRY_RUN == false ]] && ! docker info >/dev/null 2>&1; then
+    log_warn "docker is installed but the daemon is not responding; skipping prune."
+    return 0
+  fi
+  # Safe set: dangling images, stopped containers, unused networks, build cache.
+  run_soft docker system prune -f
+  if [[ $DO_CLEAN_DOCKER_VOLUMES == true ]]; then
+    log_warn "Also pruning UNUSED VOLUMES (--clean-docker-volumes): this destroys data in any volume not attached to a running container."
+    run_soft docker system prune -f --volumes
+  else
+    log_info "Unused volumes were NOT touched (add --clean-docker-volumes to include them; destructive)."
+  fi
+  log_ok "Docker prune complete."
+}
+
+# --- systemd journal vacuum (opt-in --vacuum-journal[=SPEC]) ---------------- #
+vacuum_journal() {
+  log_step "Vacuuming the systemd journal (--vacuum-journal)"
+  if ! command -v journalctl >/dev/null 2>&1; then
+    log_info "journalctl not available; skipping journal vacuum."
+    return 0
+  fi
+  local spec="$JOURNAL_VACUUM_SPEC"
+  if [[ $spec =~ ^[0-9]+[KMG]$ ]]; then
+    log_info "Vacuuming journal down to at most ${spec}."
+    run_soft journalctl --vacuum-size="${spec}"
+  else
+    log_info "Vacuuming journal entries older than ${spec}."
+    run_soft journalctl --vacuum-time="${spec}"
+  fi
+  log_ok "Journal vacuum complete."
+}
+
+# --- Privilege-escalation audit (opt-in --audit-perms; read-only) ----------- #
+audit_permissions() {
+  log_step "Privilege-escalation audit (--audit-perms)"
+  local candidates p existing=()
+  if [[ -n ${AUDIT_PATHS:-} ]]; then
+    read -ra candidates <<< "$AUDIT_PATHS"
+  else
+    candidates=(/bin /sbin /usr /lib /lib64 /opt /etc /root /boot /var)
+  fi
+  for p in "${candidates[@]}"; do [[ -e $p ]] && existing+=("$p"); done
+  [[ ${#existing[@]} -gt 0 ]] || { log_warn "No standard paths to scan; skipping."; return 0; }
+
+  sec_append ""
+  sec_append "==================== Privilege-Escalation Audit ===================="
+  sec_append "Scanned (one filesystem each, -xdev): ${existing[*]}"
+
+  # SUID/SGID binaries.
+  local suid; suid="$(find "${existing[@]}" -xdev -type f -perm /6000 2>/dev/null | sort || true)"
+  local nsuid; nsuid="$(printf '%s' "$suid" | grep -c . || true)"
+  sec_append ""
+  sec_append "----- SUID/SGID binaries (${nsuid}) -----"
+  if [[ -n $suid ]]; then
+    while IFS= read -r f; do
+      [[ -n $f ]] && sec_append "  $(ls -ld "$f" 2>/dev/null || printf '%s' "$f")"
+    done <<< "$suid"
+  else
+    sec_append "  (none found)"
+  fi
+  local rogue; rogue="$(printf '%s\n' "$suid" | grep -E '^/(tmp|var/tmp|dev/shm|home|root|srv|mnt|media)/' || true)"
+  if [[ -n ${rogue//[$'\n']/} ]]; then
+    log_warn "SUID/SGID binaries in unusual writable locations (REVIEW — possible privesc):"
+    sec_append ""
+    sec_append "  [!] SUID/SGID in unusual locations:"
+    while IFS= read -r f; do
+      [[ -n $f ]] && { log_warn "      $f"; sec_append "      $f"; }
+    done <<< "$rogue"
+  else
+    log_ok "No SUID/SGID binaries in unusual writable locations."
+  fi
+
+  # World-writable files and (non-sticky) directories.
+  local wf wd
+  wf="$(find "${existing[@]}" -xdev -type f -perm -0002 2>/dev/null | sort || true)"
+  wd="$(find "${existing[@]}" -xdev -type d -perm -0002 ! -perm -1000 2>/dev/null | sort || true)"
+  local nwf nwd
+  nwf="$(printf '%s' "$wf" | grep -c . || true)"
+  nwd="$(printf '%s' "$wd" | grep -c . || true)"
+  sec_append ""
+  sec_append "----- World-writable files (${nwf}) -----"
+  if [[ -n $wf ]]; then
+    while IFS= read -r f; do [[ -n $f ]] && sec_append "  $f"; done <<< "$wf"
+  else
+    sec_append "  (none found)"
+  fi
+  sec_append ""
+  sec_append "----- World-writable dirs without sticky bit (${nwd}) -----"
+  if [[ -n $wd ]]; then
+    while IFS= read -r f; do [[ -n $f ]] && sec_append "  $f"; done <<< "$wd"
+  else
+    sec_append "  (none found)"
+  fi
+  if (( nwf > 0 || nwd > 0 )); then
+    log_warn "Found ${nwf} world-writable file(s) and ${nwd} world-writable dir(s) without sticky bit (details in the report)."
+  else
+    log_ok "No world-writable files or non-sticky world-writable dirs in scanned paths."
+  fi
+  log_ok "Privilege-escalation audit complete."
+}
+
+# --- Attack-surface summary (read-only; always appended to the report) ------ #
+attack_surface_summary() {
+  log_step "Attack-surface summary (listening ports & failed services)"
+  sec_append ""
+  sec_append "==================== Attack Surface ===================="
+  sec_append ""
+  sec_append "----- Listening sockets (ss -tulpn) -----"
+  if command -v ss >/dev/null 2>&1; then
+    local out; out="$(ss -tulpn 2>/dev/null || true)"
+    sec_append "${out:-  (no output)}"
+    local n; n="$(printf '%s\n' "$out" | grep -c -i listen || true)"
+    log_info "Listening sockets: ${n}."
+  elif command -v netstat >/dev/null 2>&1; then
+    local out; out="$(netstat -tulpn 2>/dev/null || true)"
+    sec_append "${out:-  (no output)}"
+  else
+    sec_append "  (neither ss nor netstat is available)"
+    log_info "Neither ss nor netstat installed; skipping port list."
+  fi
+  sec_append ""
+  sec_append "----- Failed systemd units (systemctl --failed) -----"
+  if command -v systemctl >/dev/null 2>&1; then
+    local fout; fout="$(systemctl --failed --no-legend --plain 2>/dev/null || true)"
+    if [[ -n ${fout//[$'\n\t ']/} ]]; then
+      sec_append "$fout"
+      local nf; nf="$(printf '%s\n' "$fout" | grep -c . || true)"
+      log_warn "${nf} failed systemd unit(s) detected (details in the report)."
+    else
+      sec_append "  (no failed units)"
+      log_ok "No failed systemd units."
+    fi
+  else
+    sec_append "  (systemctl not available)"
+  fi
+}
+
+# --- SSH posture (read-only, passive audit of sshd_config) ------------------ #
+ssh_posture_check() {
+  log_step "SSH security posture (passive audit of sshd_config)"
+  local cfg="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+  sec_append ""
+  sec_append "==================== SSH Security Posture ===================="
+  if [[ ! -r $cfg ]]; then
+    sec_append "  ${cfg} not present or not readable; skipping."
+    log_info "${cfg} not present/readable; skipping SSH posture check."
+    return 0
+  fi
+  _ssh_eff() {  # last uncommented value of a directive (case-insensitive)
+    grep -iE "^[[:space:]]*$1[[:space:]]+" "$cfg" 2>/dev/null | tail -n1 | awk '{print $2}' || true
+  }
+  local proot ppass pempty px11
+  proot="$(_ssh_eff PermitRootLogin)";   ppass="$(_ssh_eff PasswordAuthentication)"
+  pempty="$(_ssh_eff PermitEmptyPasswords)"; px11="$(_ssh_eff X11Forwarding)"
+  sec_append "  PermitRootLogin        : ${proot:-(unset; default prohibit-password)}"
+  sec_append "  PasswordAuthentication : ${ppass:-(unset; default yes)}"
+  sec_append "  PermitEmptyPasswords   : ${pempty:-(unset; default no)}"
+  sec_append "  X11Forwarding          : ${px11:-(unset; default no)}"
+  sec_append ""
+  local findings=0
+  if [[ ${proot,,} == yes ]]; then
+    log_warn "SSH: PermitRootLogin yes — direct root login over SSH is enabled."
+    sec_append "  [!] PermitRootLogin yes — consider 'prohibit-password' or 'no'."
+    findings=$((findings+1))
+  fi
+  if [[ ${pempty,,} == yes ]]; then
+    log_warn "SSH: PermitEmptyPasswords yes — accounts with empty passwords can log in."
+    sec_append "  [!] PermitEmptyPasswords yes — set to 'no'."
+    findings=$((findings+1))
+  fi
+  if [[ ${ppass,,} == yes ]]; then
+    log_warn "SSH: PasswordAuthentication yes — key-only auth resists brute force better."
+    sec_append "  [i] PasswordAuthentication yes — consider key-only ('no')."
+    findings=$((findings+1))
+  fi
+  if (( findings == 0 )); then
+    log_ok "SSH posture: no high-risk directives flagged."
+    sec_append "  No high-risk directives flagged."
+  fi
+  sec_append "  (Passive audit only — ${cfg} was not modified.)"
+}
+
+# =========================================================================== #
 #  Usage
 # =========================================================================== #
 usage() {
@@ -183,6 +593,24 @@ SAFE OPTIONS (default run is safe):
   -V, --version          Print version and exit
   -h, --help             Show this help and exit
 
+OPTIONAL MAINTENANCE & SECURITY (opt-in; safe-by-default is preserved):
+      --snapshot           Create a Timeshift/BTRFS (Snapper) snapshot BEFORE the
+                           upgrade; aborts the run if no snapshot tool works
+      --backup-etc         Write a compressed, root-only /etc archive (implied
+                           automatically before any aggressive repair)
+      --vacuum-journal[=N] Vacuum the systemd journal (default 14d; N may be a
+                           time like 30d or a size like 500M)
+      --clean-docker       'docker system prune -f' (dangling images, stopped
+                           containers, unused networks, build cache)
+      --clean-docker-volumes
+                           Also prune UNUSED VOLUMES (implies --clean-docker;
+                           DESTRUCTIVE — deletes data in detached volumes)
+      --audit-perms        Scan for SUID/SGID binaries and world-writable paths
+                           (read-only privilege-escalation audit)
+
+  A listening-port + failed-service summary and a passive SSH-config posture
+  check are ALWAYS appended to the system report (both read-only).
+
 AGGRESSIVE / REPAIR OPTIONS (opt-in; modify system files; always backed up):
       --repair-mirrors     Replace dead apt mirrors and restore official repos
                            for the detected distro (backs up sources first)
@@ -198,6 +626,15 @@ EXAMPLES:
   sudo ./${SCRIPT_NAME} --dry-run --repair-mirrors
   sudo ./${SCRIPT_NAME} --repair-mirrors --aggressive-network
   sudo ./${SCRIPT_NAME} --install-realtek
+  sudo ./${SCRIPT_NAME} --snapshot --vacuum-journal=30d
+  sudo ./${SCRIPT_NAME} --clean-docker --audit-perms
+
+ENVIRONMENT (failure/abort alerts for unattended timer runs):
+  MAINTAIN_DISCORD_WEBHOOK   Discord webhook URL to alert on failure/abort
+  MAINTAIN_TELEGRAM_TOKEN    Telegram bot token   (with MAINTAIN_TELEGRAM_CHAT)
+  MAINTAIN_TELEGRAM_CHAT     Telegram chat id
+  Set these via the environment (e.g. a systemd EnvironmentFile=) — never on
+  the command line, where 'ps' would expose them.
 USAGE
 }
 
@@ -429,12 +866,13 @@ interactive_menu() {
     # fd swap (3>&1 1>&2 2>&3) captures the selection; Cancel/Esc or any
     # whiptail failure leaves choice empty and we degrade to the classic menu.
     choice="$(whiptail --title "linux-maintain ${SCRIPT_VERSION}" \
-      --menu "Choose maintenance type:" 18 74 6 \
+      --menu "Choose maintenance type:" 20 78 7 \
         "1" "Safe Routine Maintenance (default)" \
         "2" "Full Aggressive Maintenance (network/mirror fixes + tuning)" \
         "3" "Storage Tuning Only (+ safe maintenance)" \
         "4" "Network & Mirror Repair Only (+ safe maintenance)" \
         "5" "Dry-Run (preview only, no changes)" \
+        "6" "Security Audit (safe maintenance + perms/ports/SSH posture)" \
         "0" "Exit" \
       3>&1 1>&2 2>&3)" || choice=""
   fi
@@ -449,9 +887,10 @@ interactive_menu() {
     echo "  3) Storage Tuning Only (+ Safe Maintenance)"
     echo "  4) Network & Mirror Repair Only (+ Safe Maintenance)"
     echo "  5) Dry-Run (Preview only, no changes)"
+    echo "  6) Security Audit (Safe Maintenance + SUID/world-writable + ports + SSH posture)"
     echo "  0) Exit"
     echo ""
-    if ! read -rp "  [?] Enter your choice [0-5]: " choice; then
+    if ! read -rp "  [?] Enter your choice [0-6]: " choice; then
       echo ""; log_info "No input received; exiting."; exit 0
     fi
     echo ""
@@ -465,6 +904,8 @@ interactive_menu() {
     3) log_info "Mode: Storage Tuning";          DO_TUNE_STORAGE=true ;;
     4) log_info "Mode: Network & Mirror Repair"; DO_REPAIR_MIRRORS=true; AGGRESSIVE_NET=true; FORCE_IPV4=true ;;
     5) log_info "Mode: Dry-Run";                 DRY_RUN=true ;;
+    6) log_info "Mode: Security Audit (read-only checks added to a safe run)"
+       DO_AUDIT_PERMS=true ;;
     0) log_info "Exiting..."; exit 0 ;;
     *) log_err "Invalid choice. Exiting..."; exit 1 ;;
   esac
@@ -489,6 +930,13 @@ while [[ $# -gt 0 ]]; do
     --repair-mirrors)      DO_REPAIR_MIRRORS=true ;;
     --install-realtek)     DO_INSTALL_REALTEK=true ;;
     --aggressive-network)  AGGRESSIVE_NET=true; FORCE_IPV4=true ;;
+    --snapshot)            DO_SNAPSHOT=true ;;
+    --backup-etc)          DO_BACKUP_ETC=true ;;
+    --clean-docker)        DO_CLEAN_DOCKER=true ;;
+    --clean-docker-volumes) DO_CLEAN_DOCKER=true; DO_CLEAN_DOCKER_VOLUMES=true ;;
+    --vacuum-journal)      JOURNAL_VACUUM=true ;;
+    --vacuum-journal=*)    JOURNAL_VACUUM=true; JOURNAL_VACUUM_SPEC="${1#*=}" ;;
+    --audit-perms)         DO_AUDIT_PERMS=true ;;
     --reboot)              REBOOT_MODE="always" ;;
     --no-reboot)           REBOOT_MODE="never" ;;
     --no-color)            NO_COLOR=true; USE_COLOR=false ;;
@@ -498,6 +946,12 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Any aggressive flag triggers an automatic /etc archive as a safety net.
+if [[ $DO_REPAIR_MIRRORS == true || $DO_TUNE_STORAGE == true \
+   || $AGGRESSIVE_NET == true || $DO_INSTALL_REALTEK == true ]]; then
+  WANTS_AGGRESSIVE=true
+fi
 
 # =========================================================================== #
 #  Pre-flight: root required (except in pure preview mode)
@@ -510,6 +964,7 @@ if [[ $DRY_RUN == false ]]; then
   LOGDIR="/var/log"; [[ -w $LOGDIR ]] || LOGDIR="/tmp"
   LOGFILE="${LOGDIR}/linux-maintain_${START_STAMP}.log"
   : > "$LOGFILE" 2>/dev/null || LOGFILE=""
+  [[ -n $LOGFILE ]] && REPORT="${LOGFILE%.log}_report.txt" || REPORT=""
   # Full logging: mirror ALL stdout + stderr (apt, dpkg, errors — everything)
   # into the log file, not just the script's own messages.
   if [[ -n $LOGFILE ]]; then
@@ -517,6 +972,9 @@ if [[ $DRY_RUN == false ]]; then
     EXEC_LOG_ACTIVE=true
   fi
 fi
+
+# Past pre-flight: from here a non-zero exit is a real failure -> arm the alert.
+NOTIFY_ARMED=true
 
 # =========================================================================== #
 #  Banner
@@ -562,6 +1020,13 @@ IS_BAREMETAL=false; [[ $VIRT == "none" ]] && IS_BAREMETAL=true
 log_info "Environment: ${VIRT} (bare metal: ${IS_BAREMETAL})"
 
 # =========================================================================== #
+#  Optional: compressed /etc archive before any aggressive, system-wide repair
+# =========================================================================== #
+if [[ $DO_BACKUP_ETC == true || $WANTS_AGGRESSIVE == true ]]; then
+  backup_etc_archive
+fi
+
+# =========================================================================== #
 #  Optional: repair apt mirrors BEFORE refreshing package lists
 # =========================================================================== #
 [[ $DO_REPAIR_MIRRORS == true ]] && repair_mirrors
@@ -574,6 +1039,9 @@ check_disk_space
 
 log_step "Updating package lists"
 apt_update
+
+# Pre-upgrade snapshot (opt-in). Must come before any package modification.
+[[ $DO_SNAPSHOT == true ]] && create_pre_upgrade_snapshot
 
 log_step "Upgrading installed packages"
 run_soft apt-get upgrade -y "${APT_OPTS[@]}"
@@ -747,6 +1215,10 @@ fi
 
 have update-grub && run_soft update-grub
 
+# --- Optional container cleanup & journal vacuum (both opt-in) -------------- #
+[[ $DO_CLEAN_DOCKER == true ]] && clean_docker
+[[ $JOURNAL_VACUUM == true ]] && vacuum_journal
+
 # =========================================================================== #
 #  Optional utilities (fastfetch — a modern neofetch-style system viewer)
 # =========================================================================== #
@@ -758,7 +1230,6 @@ apt_install fastfetch dconf-editor
 # =========================================================================== #
 log_step "Writing system report"
 if [[ $DRY_RUN == false && -n $LOGFILE ]]; then
-  REPORT="${LOGFILE%.log}_report.txt"
   {
     echo "==================== System Report ===================="
     echo "Generated : $(date)"
@@ -780,6 +1251,19 @@ if [[ $DRY_RUN == false && -n $LOGFILE ]]; then
   log_ok "Report saved to ${REPORT}"
 else
   log_info "(dry run) report generation skipped."
+fi
+
+# =========================================================================== #
+#  Security checks (read-only): privesc audit (opt-in), attack surface, SSH.
+#  These append to the system report and log any warnings; safe in --dry-run
+#  (they only read state, so they run and report even in preview mode).
+# =========================================================================== #
+log_step "Security checks (read-only)"
+[[ $DO_AUDIT_PERMS == true ]] && audit_permissions
+attack_surface_summary
+ssh_posture_check
+if [[ $DRY_RUN == false && -n ${REPORT:-} && -e ${REPORT:-/nonexistent} ]]; then
+  log_ok "Security summary appended to ${REPORT}"
 fi
 
 # =========================================================================== #

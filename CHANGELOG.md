@@ -3,6 +3,67 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning follows [SemVer](https://semver.org/).
 
+## [3.2.0] — 2026-06-18
+
+Backward-compatible feature release focused on rollback safety, deeper cleanup,
+unattended-run alerting, and read-only security visibility. The safe-by-default
+model is unchanged: a plain run still rewrites no sources, edits no fstab, and
+restarts no network. Every new heavyweight or destructive action is opt-in.
+
+### Added
+- **Pre-upgrade snapshots** (`--snapshot`): creates a tagged Timeshift snapshot
+  (any filesystem) or, on BTRFS, a Snapper snapshot, *before* the upgrade.
+  Because the goal is a guaranteed rollback path, a requested-but-impossible
+  snapshot **aborts before any package change** rather than upgrading
+  unprotected.
+- **Container cleanup** (`--clean-docker`): `docker system prune -f` for the
+  safe set (dangling images, stopped containers, unused networks, build cache).
+  Volume pruning is split into a separate, explicit `--clean-docker-volumes`
+  (implies `--clean-docker`) because deleting detached volumes is destructive.
+  Skips cleanly when docker is absent or the daemon is down.
+- **Webhook failure alerts**: on a non-zero exit *after* pre-flight (including a
+  disk-guard or snapshot abort during an unattended timer run), an alert is
+  sent to Discord and/or Telegram. **Discord** receives a professional red
+  **rich embed** (fields: Hostname, Exit Code, Version, Trigger/Reason,
+  Timestamp, and an ANSI-stripped log tail, plus a native embed timestamp);
+  **Telegram** receives the equivalent as plain text. Configured via environment
+  only (`MAINTAIN_DISCORD_WEBHOOK`, `MAINTAIN_TELEGRAM_TOKEN`,
+  `MAINTAIN_TELEGRAM_CHAT`) so secrets never appear in `ps`. Successful runs
+  never alert. The JSON payload is built with a hardened escaper that keeps the
+  embed valid even when the reason or log contains quotes, backslashes,
+  newlines, or UTF-8.
+- **Compressed /etc archive** (`--backup-etc`): writes a root-only
+  `etc-backup_<timestamp>.tar.gz`; runs automatically before any aggressive
+  repair (`--repair-mirrors`, `--tune-storage`, `--aggressive-network`,
+  `--install-realtek`).
+- **Journal vacuuming** (`--vacuum-journal[=SPEC]`): `journalctl --vacuum-time`
+  (default `14d`) or `--vacuum-size` when SPEC ends in K/M/G (e.g. `500M`).
+- **Privilege-escalation audit** (`--audit-perms`): read-only scan for SUID/SGID
+  binaries and world-writable files / non-sticky world-writable directories,
+  flagging SUID/SGID in unusual writable locations.
+- **Attack-surface summary** (always, read-only): listening sockets
+  (`ss -tulpn`, `netstat` fallback) and failed units (`systemctl --failed`)
+  appended to the system report.
+- **SSH posture check** (always, read-only): passive audit of `sshd_config`
+  flagging `PermitRootLogin yes`, `PermitEmptyPasswords yes`, and
+  password authentication; never modifies the file.
+- Interactive menu option **6) Security Audit** (safe maintenance plus the
+  privilege-escalation audit).
+- `test_behavior.sh`: nine new test groups (flag parsing, menu option 6,
+  journal-vacuum routing, docker tiers, SSH posture, attack surface, privesc
+  audit, /etc archive, snapshot abort/success, and an end-to-end disk-guard →
+  Discord alert with a valid rich-embed payload), 68 assertions total.
+
+### Changed
+- The ERR trap and `die()` now record a failure context that the EXIT trap uses
+  to send a single alert. `ssh_posture_check` and `audit_permissions` honour the
+  optional `SSHD_CONFIG` and `AUDIT_PATHS` overrides. Version bumped to 3.2.0.
+
+### Unchanged (guaranteed)
+- All pre-existing CLI flags, their semantics, and the step order of a default
+  run; the `run` / `run_soft` model and `--dry-run` preview; and the
+  safe-by-default contract (no sources/fstab/network changes unless opted in).
+
 ## [3.1.0] — 2026-06-11
 
 Backward-compatible feature release. The core structure, safe-by-default logic
