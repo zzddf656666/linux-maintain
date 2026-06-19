@@ -310,4 +310,4 @@ Issues and pull requests are welcome — especially reports from distros or hard
 
 ## 📜 License
 
-MIT — see [LICENSE](LICENSE). © 2026 Abdelrahman Fekry El-Maghraby.
+MIT — see [LICENSE](LICENSE). © 2026 Abdelrahman El-Maghraby.
